@@ -95,9 +95,6 @@ void matmul(const float* A, const float* B, float* C, int M, int K, int N) {
     }
 }
 
-void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N) {
-
-}
 
 // same computation as matmul(), reordered into TILE x TILE blocks so a chunk
 // of A, B, and C stay resident in cache while they're being reused, instead
@@ -135,6 +132,42 @@ void linear(const float* x, const float* W, const float* b,
                 sum += x[i * in_features + k] * W[j * in_features + k];
             }
             out[i * out_features + j] = sum + b[j];
+        }
+    }
+}
+
+// same tiling idea as matmul_tiled, applied to linear()'s x @ W^T + b.
+// unlike matmul, both x and W are already contiguously accessed here -- but the
+// full W matrix (e.g. 9.4 MB for the mlp c_fc weight) still doesn't fit in
+// cache, so it still gets evicted and re-fetched from RAM once per row of x
+// without tiling. this fixes that the same way: work on one small chunk of
+// W at a time, fully, before moving to the next chunk.
+void linear_tiled(const float* x, const float* W, const float* b,
+                   float* out, int seq_len, int in_features, int out_features, int TILE) {
+    // start each output at its bias, then accumulate x @ W^T contributions across k0 chunks
+    for (int i = 0; i < seq_len; ++i) {
+        for (int j = 0; j < out_features; ++j) {
+            out[i * out_features + j] = b[j];
+        }
+    }
+
+    for (int i0 = 0; i0 < seq_len; i0 += TILE) {
+        for (int j0 = 0; j0 < out_features; j0 += TILE) {
+            for (int k0 = 0; k0 < in_features; k0 += TILE) {
+                int i_max = std::min(i0 + TILE, seq_len);
+                int j_max = std::min(j0 + TILE, out_features);
+                int k_max = std::min(k0 + TILE, in_features);
+
+                for (int i = i0; i < i_max; ++i) {
+                    for (int j = j0; j < j_max; ++j) {
+                        float sum = out[i * out_features + j];
+                        for (int k = k0; k < k_max; ++k) {
+                            sum += x[i * in_features + k] * W[j * in_features + k];
+                        }
+                        out[i * out_features + j] = sum;
+                    }
+                }
+            }
         }
     }
 }

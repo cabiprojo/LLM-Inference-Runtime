@@ -53,6 +53,10 @@ void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N,
 void linear(const float* x, const float* W, const float* b,
             float* out, int seq_len, int in_features, int out_features);
 
+// same result as linear(), computed TILE x TILE block at a time for cache reuse
+void linear_tiled(const float* x, const float* W, const float* b,
+                   float* out, int seq_len, int in_features, int out_features, int TILE);
+
 // multi-head causal self-attention for one block
 // x: (seq_len, n_embd), layer-normed input (ln_1 output)
 // c_attn_w: (3*n_embd, n_embd), c_attn_b: (3*n_embd), combined qkv projection
