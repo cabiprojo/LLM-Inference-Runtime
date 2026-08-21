@@ -8,9 +8,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_executable(gpt2
-    src/main.cpp
+add_library(ops STATIC
+    src/ops.cpp
     src/io/tensor_io.cpp
 )
+target_include_directories(ops PUBLIC src)
 
-target_include_directories(gpt2 PRIVATE src)
+add_executable(gpt2 src/main.cpp)
+target_link_libraries(gpt2 PRIVATE ops)
+
+add_executable(bench_matmul src/benchmark_matmul.cpp)
+target_link_libraries(bench_matmul PRIVATE ops)
