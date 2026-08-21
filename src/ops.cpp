@@ -1,5 +1,6 @@
 #include "ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -90,6 +91,37 @@ void matmul(const float* A, const float* B, float* C, int M, int K, int N) {
                 sum += A[i * K + k] * B[k * N + j];
             }
             C[i * N + j] = sum;
+        }
+    }
+}
+
+void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N) {
+
+}
+
+// same computation as matmul(), reordered into TILE x TILE blocks so a chunk
+// of A, B, and C stay resident in cache while they're being reused, instead
+// of re-fetching from RAM for every single output element
+void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N, int TILE) {
+    for (int idx = 0; idx < M * N; ++idx) C[idx] = 0.0f;
+
+    for (int i0 = 0; i0 < M; i0 += TILE) {
+        for (int j0 = 0; j0 < N; j0 += TILE) {
+            for (int k0 = 0; k0 < K; k0 += TILE) {
+                int i_max = std::min(i0 + TILE, M);
+                int j_max = std::min(j0 + TILE, N);
+                int k_max = std::min(k0 + TILE, K);
+
+                for (int i = i0; i < i_max; ++i) {
+                    for (int j = j0; j < j_max; ++j) {
+                        float sum = C[i * N + j];
+                        for (int k = k0; k < k_max; ++k) {
+                            sum += A[i * K + k] * B[k * N + j];
+                        }
+                        C[i * N + j] = sum;
+                    }
+                }
+            }
         }
     }
 }

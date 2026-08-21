@@ -44,6 +44,9 @@ int argmax(const float* logits, int vocab_size);
 // M = number of rows in A, K = number of columns in A (and rows in B), N = number of columns in B
 void matmul(const float* A, const float* B, float* C, int M, int K, int N);
 
+// same result as matmul(), computed TILE x TILE block at a time for cache reuse
+void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N, int TILE);
+
 // out = x @ W^T + b
 // x: (seq_len, in_features), W: (out_features, in_features), b: (out_features)
 // out: (seq_len, out_features)
