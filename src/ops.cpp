@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <immintrin.h>
 #include <string>
 #include <vector>
 
@@ -111,6 +112,49 @@ void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N,
 
                 for (int i = i0; i < i_max; ++i) {
                     for (int j = j0; j < j_max; ++j) {
+                        float sum = C[i * N + j];
+                        for (int k = k0; k < k_max; ++k) {
+                            sum += A[i * K + k] * B[k * N + j];
+                        }
+                        C[i * N + j] = sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// same result as matmul_tiled, but the inner loop is vectorized across j
+// (8 output columns at once) instead of k, since B[k*N+j] is contiguous in j
+// but strided in k -- SIMD wants the contiguous direction
+void matmul_simd(const float* A, const float* B, float* C, int M, int K, int N, int TILE) {
+    for (int idx = 0; idx < M * N; ++idx) C[idx] = 0.0f;
+
+    for (int i0 = 0; i0 < M; i0 += TILE) {
+        for (int j0 = 0; j0 < N; j0 += TILE) {
+            for (int k0 = 0; k0 < K; k0 += TILE) {
+                int i_max = std::min(i0 + TILE, M);
+                int j_max = std::min(j0 + TILE, N);
+                int k_max = std::min(k0 + TILE, K);
+
+                for (int i = i0; i < i_max; ++i) {
+                    int j = j0;
+
+                    // 8 columns at a time with AVX2
+                    for (; j + 8 <= j_max; j += 8) {
+                        __m256 acc = _mm256_loadu_ps(&C[i * N + j]);
+
+                        for (int k = k0; k < k_max; ++k) {
+                            __m256 a_bcast = _mm256_set1_ps(A[i * K + k]);
+                            __m256 b_vec = _mm256_loadu_ps(&B[k * N + j]);
+                            acc = _mm256_fmadd_ps(a_bcast, b_vec, acc);
+                        }
+
+                        _mm256_storeu_ps(&C[i * N + j], acc);
+                    }
+
+                    // scalar fallback for leftover columns, when (j_max - j0) isn't a multiple of 8
+                    for (; j < j_max; ++j) {
                         float sum = C[i * N + j];
                         for (int k = k0; k < k_max; ++k) {
                             sum += A[i * K + k] * B[k * N + j];

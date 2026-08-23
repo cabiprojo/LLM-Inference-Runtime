@@ -62,6 +62,25 @@ void check_correctness(int M, int K, int N, int tile) {
                << ", max abs diff = " << max_diff << "\n";
 }
 
+// confirms matmul_simd produces the same result as matmul, just reordered + vectorized
+void check_simd_correctness(int M, int K, int N, int tile) {
+    std::mt19937 rng(13);
+    std::vector<float> A(M * K), B(K * N), C_naive(M * N), C_simd(M * N);
+    fill_random(A, rng);
+    fill_random(B, rng);
+
+    matmul(A.data(), B.data(), C_naive.data(), M, K, N);
+    matmul_simd(A.data(), B.data(), C_simd.data(), M, K, N, tile);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < M * N; ++i) {
+        max_diff = std::max(max_diff, std::fabs(C_naive[i] - C_simd[i]));
+    }
+    std::cout << (max_diff < 1e-3f ? "[PASS] " : "[FAIL] ")
+               << "matmul_simd matches matmul, tile=" << tile
+               << ", max abs diff = " << max_diff << "\n";
+}
+
 // confirms linear_tiled produces the same result as linear, just reordered
 void check_linear_correctness(int seq_len, int in_features, int out_features, int tile) {
     std::mt19937 rng(11);
@@ -138,6 +157,14 @@ int main() {
     }, M, K, N, 20);
     benchmark("matmul_tiled(TILE=64)", [](const float* A, const float* B, float* C, int M, int K, int N) {
         matmul_tiled(A, B, C, M, K, N, 64);
+    }, M, K, N, 20);
+
+    std::cout << "\n";
+
+    // SIMD, on top of tiling -- must still match matmul exactly
+    check_simd_correctness(64, 768, 3072, 16);
+    benchmark("matmul_simd(TILE=16) ", [](const float* A, const float* B, float* C, int M, int K, int N) {
+        matmul_simd(A, B, C, M, K, N, 16);
     }, M, K, N, 20);
 
     std::cout << "\n";

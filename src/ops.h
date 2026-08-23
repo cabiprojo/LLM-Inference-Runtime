@@ -47,6 +47,9 @@ void matmul(const float* A, const float* B, float* C, int M, int K, int N);
 // same result as matmul(), computed TILE x TILE block at a time for cache reuse
 void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N, int TILE);
 
+// same result as matmul_tiled(), inner loop vectorized 8-wide with AVX2
+void matmul_simd(const float* A, const float* B, float* C, int M, int K, int N, int TILE);
+
 // out = x @ W^T + b
 // x: (seq_len, in_features), W: (out_features, in_features), b: (out_features)
 // out: (seq_len, out_features)
