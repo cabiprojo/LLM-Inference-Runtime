@@ -216,15 +216,30 @@ void linear_tiled(const float* x, const float* W, const float* b,
     }
 }
 
+namespace {
+
+// dispatches to linear() or linear_tiled(TILE=16) depending on use_tiled --
+// lets attention()/transformer_block() share one code path for both variants
+void call_linear(bool use_tiled, const float* x, const float* W, const float* b,
+                  float* out, int seq_len, int in_features, int out_features) {
+    if (use_tiled) {
+        linear_tiled(x, W, b, out, seq_len, in_features, out_features, 16);
+    } else {
+        linear(x, W, b, out, seq_len, in_features, out_features);
+    }
+}
+
+}  // namespace
+
 void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
                const float* c_proj_w, const float* c_proj_b,
-               float* out, int seq_len, int n_embd, int n_head) {
+               float* out, int seq_len, int n_embd, int n_head, bool use_tiled) {
     int head_dim = n_embd / n_head;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     // combined q, k, v projection in one linear call
     std::vector<float> qkv(seq_len * 3 * n_embd);
-    linear(x, c_attn_w, c_attn_b, qkv.data(), seq_len, n_embd, 3 * n_embd);
+    call_linear(use_tiled, x, c_attn_w, c_attn_b, qkv.data(), seq_len, n_embd, 3 * n_embd);
 
     std::vector<float> concat(seq_len * n_embd);
     std::vector<float> Qh(seq_len * head_dim);
@@ -267,11 +282,12 @@ void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
         }
     }
 
-    linear(concat.data(), c_proj_w, c_proj_b, out, seq_len, n_embd, n_embd);
+    call_linear(use_tiled, concat.data(), c_proj_w, c_proj_b, out, seq_len, n_embd, n_embd);
 }
 
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
-                        const std::string& prefix, int seq_len, int n_embd, int n_head, float eps) {
+                        const std::string& prefix, int seq_len, int n_embd, int n_head, float eps,
+                        bool use_tiled) {
     std::vector<float> ln1_out(seq_len * n_embd);
     layer_norm(x, weights.at(prefix + "ln_1.weight").data.data(),
                weights.at(prefix + "ln_1.bias").data.data(),
@@ -283,7 +299,7 @@ void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& 
               weights.at(prefix + "attn.c_attn.bias").data.data(),
               weights.at(prefix + "attn.c_proj.weight").data.data(),
               weights.at(prefix + "attn.c_proj.bias").data.data(),
-              attn_out.data(), seq_len, n_embd, n_head);
+              attn_out.data(), seq_len, n_embd, n_head, use_tiled);
 
     for (int i = 0; i < seq_len * n_embd; ++i) {
         x[i] += attn_out[i];
@@ -296,15 +312,15 @@ void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& 
 
     int mlp_hidden = weights.at(prefix + "mlp.c_fc.weight").shape[0];
     std::vector<float> fc_out(seq_len * mlp_hidden);
-    linear(ln2_out.data(), weights.at(prefix + "mlp.c_fc.weight").data.data(),
-           weights.at(prefix + "mlp.c_fc.bias").data.data(),
-           fc_out.data(), seq_len, n_embd, mlp_hidden);
+    call_linear(use_tiled, ln2_out.data(), weights.at(prefix + "mlp.c_fc.weight").data.data(),
+                weights.at(prefix + "mlp.c_fc.bias").data.data(),
+                fc_out.data(), seq_len, n_embd, mlp_hidden);
     gelu(fc_out.data(), fc_out.data(), seq_len * mlp_hidden);
 
     std::vector<float> mlp_out(seq_len * n_embd);
-    linear(fc_out.data(), weights.at(prefix + "mlp.c_proj.weight").data.data(),
-           weights.at(prefix + "mlp.c_proj.bias").data.data(),
-           mlp_out.data(), seq_len, mlp_hidden, n_embd);
+    call_linear(use_tiled, fc_out.data(), weights.at(prefix + "mlp.c_proj.weight").data.data(),
+                weights.at(prefix + "mlp.c_proj.bias").data.data(),
+                mlp_out.data(), seq_len, mlp_hidden, n_embd);
 
     for (int i = 0; i < seq_len * n_embd; ++i) {
         x[i] += mlp_out[i];

@@ -65,12 +65,15 @@ void linear_tiled(const float* x, const float* W, const float* b,
 // c_attn_w: (3*n_embd, n_embd), c_attn_b: (3*n_embd), combined qkv projection
 // c_proj_w: (n_embd, n_embd), c_proj_b: (n_embd), output projection
 // out: (seq_len, n_embd)
+// use_tiled: if true, internal linear() calls use linear_tiled(TILE=16) instead
 void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
                const float* c_proj_w, const float* c_proj_b,
-               float* out, int seq_len, int n_embd, int n_head);
+               float* out, int seq_len, int n_embd, int n_head, bool use_tiled = false);
 
 // one transformer block, x is updated in place to become this block's output
 // ln_1 -> attention -> residual add -> ln_2 -> mlp -> residual add
 // prefix selects this block's weights, e.g. "h.0."
+// use_tiled: if true, every internal linear() call uses linear_tiled(TILE=16) instead
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
-                        const std::string& prefix, int seq_len, int n_embd, int n_head, float eps);
+                        const std::string& prefix, int seq_len, int n_embd, int n_head, float eps,
+                        bool use_tiled = false);
