@@ -21,11 +21,11 @@ Five stages, each one checked against the real model before moving on to the nex
 | `matmul`, isolated (M=64, K=768, N=3072) | 921-1327 ms | 87 ms tiled, 25 ms tiled+SIMD, 4-5 ms tiled+SIMD+threaded | ~15x, ~37-53x, ~200-300x |
 | `linear`, one block (real weight shapes) | 308-448 ms | 161-195 ms tiled, 47-155 ms threaded | ~1.9-2.3x, then further with threading |
 | Full 12-block forward pass, real engine | 3201-5601 ms | 1850-2459 ms tiled, 587 ms threaded | ~2.28x tiled, ~5.5x threaded |
-| Generation, 20 new tokens | 20663 ms | 2246 ms with KV-cache | ~9.2x |
+| Generation, 20 new tokens | 20663-18868 ms | 1899 ms KV-cache only, 1286 ms KV-cache+tiled decode | ~9.9x, then ~14.7x |
 
 The forward pass row and the generation row are the ones that actually matter. They're not projections pulled from some isolated benchmark, they're the real binary, timed directly, with every path checked for correctness before I trusted the speed numbers.
 
-**Honest comparison against plain PyTorch:** running the same 20-token generation through PyTorch on CPU (`python/benchmark_pytorch.py`, single-threaded, same prompt) takes about 751 ms, versus 2246 ms for my KV-cached engine. PyTorch is roughly 3x faster overall. That's expected, not a failure. PyTorch's CPU backend runs on Intel's oneDNN/MKL-DNN, production BLAS kernels with years of expert tuning (register blocking, prefetching, hand-tuned assembly) well beyond one pass at tiling and one hand-written SIMD loop, plus a memory allocator that avoids the repeated buffer allocations my engine does on every call. The point of this project was understanding and applying the techniques (cache locality, vectorization, KV-cache) from scratch, each one validated and each one measurably faster than the version before it, not beating a decade of production engineering.
+**Honest comparison against plain PyTorch:** running the same 20-token generation through PyTorch on CPU (`python/benchmark_pytorch.py`, single-threaded, same prompt) takes about 751 ms, versus 1286 ms for my KV-cached, tiled engine. PyTorch is still faster, about 1.7x, down from 3x before the decode-path tiling fix. That gap is expected, not a failure. PyTorch's CPU backend runs on Intel's oneDNN/MKL-DNN, production BLAS kernels with years of expert tuning (register blocking, prefetching, hand-tuned assembly) well beyond a few passes at tiling and one hand-written SIMD loop, plus a memory allocator that avoids the repeated buffer allocations my engine does on every call. The point of this project was understanding and applying the techniques (cache locality, vectorization, multithreading, KV-cache) from scratch, each one validated and each one measurably faster than the version before it, not beating a decade of production engineering, though the gap is closer than it started.
 
 ## Architecture
 
@@ -70,7 +70,11 @@ The obvious problem with that loop: every new token reruns the entire forward pa
 
 Before trusting the speedup I checked that `generate_cached()` produces byte-for-byte identical output to the non-cached version, since caching should only ever change speed, never the answer. It did. Then I benchmarked both on 20 new tokens from the same prompt: 20663 ms naive versus 2246 ms cached, about 9.2x faster. The gap grows the longer the generation runs, since it's removing recomputation that scales with sequence length.
 
-I also put together a small end-to-end demo. `python/chat.py` tokenizes a text prompt with the real GPT-2 tokenizer, calls the C++ `generate` binary (which uses the cached path by default), and decodes the result back into text. Typed "Once upon a time" in and got "Once upon a time, the world was a place of great beauty and great danger" back out.
+I also put together a small end-to-end demo. `python/chat.py` tokenizes a text prompt with the real GPT-2 tokenizer, calls the C++ `generate` binary, and decodes the result back into text. Typed "Once upon a time" in and got "Once upon a time, the world was a place of great beauty and great danger" back out.
+
+Two real bugs turned up while trying to make that demo actually fast to run. First, `generate.cpp` was calling `generate_cached()` with default arguments, so the tiling work from stage 2 was silently never turned on for the demo, only proven in isolated benchmarks. `attention_decode()` didn't even support tiling internally at all. Fixed both, and tiling the decode path (which runs once per generated token and dominates total generation time) turned out to be worth another real ~1.48x on top of KV-cache alone, about 14.7x combined versus naive, up from 9.2x.
+
+Second, and unrelated to the C++ side entirely: the demo itself took up to two minutes to start, even after fixing an unnecessary network call. Turned out `import transformers` alone took 43 seconds, because the Python venv lived on the Windows-mounted drive this project sits on, and WSL2 is slow at the "open thousands of small files" pattern that importing a big package involves. Same import from a venv on native Linux filesystem took about 1 second. Since `chat.py` only ever uses the tokenizer, never the actual model, it doesn't need torch at all, so `python/setup_chat_venv.sh` sets up a small, torch-free venv on native filesystem just for the demo. Startup went from ~90-120 seconds to about 9.5 seconds.
 
 ### Stage 5: multithreading
 
@@ -101,8 +105,14 @@ cmake --build build
 # performance (isolated matmul/linear benchmarks, naive vs tiled vs SIMD)
 ./build/bench_matmul
 
-# the actual demo: type a prompt, get generated text back
-cd python && python3 chat.py "Once upon a time" --num-new 20
+# the actual demo: type a prompt, get generated text back.
+# uses a separate, lean venv (setup_chat_venv.sh) instead of the main
+# python/venv -- chat.py only needs the tokenizer, not torch, and running it
+# from a venv on native Linux filesystem instead of the Windows-mounted drive
+# this project lives on cuts startup from ~90s to ~9s (WSL is slow at opening
+# the thousands of small files a big package import touches, across drives)
+cd python && bash setup_chat_venv.sh
+~/chat_demo_venv/bin/python chat.py "Once upon a time" --num-new 20
 
 # how does it compare to plain PyTorch on CPU?
 cd python && python3 benchmark_pytorch.py
