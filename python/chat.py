@@ -10,9 +10,15 @@ Usage:
     python3 chat.py "Once upon a time" --num-new 20
 """
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+# skip the network "check for updates" call on every run -- the tokenizer
+# files are already cached locally from dump_reference.py, no need to phone
+# home just to load them. this is what was causing the slow startup.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 from transformers import GPT2Tokenizer
 

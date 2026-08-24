@@ -108,7 +108,7 @@ void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
 // out: (1, n_embd)
 void attention_decode(const float* x_new, const float* c_attn_w, const float* c_attn_b,
                        const float* c_proj_w, const float* c_proj_b,
-                       float* out, int n_embd, int n_head, LayerKVCache& cache);
+                       float* out, int n_embd, int n_head, LayerKVCache& cache, bool use_tiled = false);
 
 // one transformer block, x is updated in place to become this block's output
 // ln_1 -> attention -> residual add -> ln_2 -> mlp -> residual add

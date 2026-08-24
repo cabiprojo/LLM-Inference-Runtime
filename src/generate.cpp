@@ -27,7 +27,12 @@ int main(int argc, char** argv) {
     const int n_layer = 12;
     const float eps = 1e-5f;
 
-    std::vector<int> result = generate_cached(prompt, weights, n_embd, n_head, n_layer, eps, num_new_tokens);
+    // use_tiled=true here matters a lot: decode runs once per generated
+    // token and dominates total generation time, so this is what actually
+    // turns on the cache-aware linear() path for the demo, not just the
+    // isolated benchmarks
+    std::vector<int> result = generate_cached(prompt, weights, n_embd, n_head, n_layer, eps,
+                                               num_new_tokens, /*use_tiled=*/true);
 
     for (size_t i = 0; i < result.size(); ++i) {
         std::cout << result[i] << (i + 1 < result.size() ? " " : "\n");

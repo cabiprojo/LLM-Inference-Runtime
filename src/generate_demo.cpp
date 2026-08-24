@@ -66,14 +66,20 @@ int main() {
     auto t0 = std::chrono::high_resolution_clock::now();
     generate(prompt, weights, n_embd, n_head, n_layer, eps, bench_new_tokens);
     auto t1 = std::chrono::high_resolution_clock::now();
-    generate_cached(prompt, weights, n_embd, n_head, n_layer, eps, bench_new_tokens);
+    generate_cached(prompt, weights, n_embd, n_head, n_layer, eps, bench_new_tokens, /*use_tiled=*/false);
     auto t2 = std::chrono::high_resolution_clock::now();
+    generate_cached(prompt, weights, n_embd, n_head, n_layer, eps, bench_new_tokens, /*use_tiled=*/true);
+    auto t3 = std::chrono::high_resolution_clock::now();
 
     double naive_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
     double cached_ms = std::chrono::duration<double>(t2 - t1).count() * 1000.0;
-    std::cout << "  naive (recompute every step):  " << naive_ms << " ms\n";
-    std::cout << "  cached (KV-cache):              " << cached_ms << " ms\n";
-    std::cout << "  speedup: " << naive_ms / cached_ms << "x\n";
+    double cached_tiled_ms = std::chrono::duration<double>(t3 - t2).count() * 1000.0;
+    std::cout << "  naive (recompute every step):     " << naive_ms << " ms\n";
+    std::cout << "  cached, no tiling in decode:       " << cached_ms << " ms\n";
+    std::cout << "  cached, tiled decode (chat.py uses this): " << cached_tiled_ms << " ms\n";
+    std::cout << "  speedup, cached vs naive: " << naive_ms / cached_ms << "x\n";
+    std::cout << "  speedup, cached+tiled vs naive: " << naive_ms / cached_tiled_ms << "x\n";
+    std::cout << "  speedup, tiled decode vs untiled decode: " << cached_ms / cached_tiled_ms << "x\n";
 
     return (match && cache_match) ? 0 : 1;
 }

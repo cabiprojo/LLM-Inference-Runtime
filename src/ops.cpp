@@ -357,13 +357,13 @@ void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
 
 void attention_decode(const float* x_new, const float* c_attn_w, const float* c_attn_b,
                        const float* c_proj_w, const float* c_proj_b,
-                       float* out, int n_embd, int n_head, LayerKVCache& cache) {
+                       float* out, int n_embd, int n_head, LayerKVCache& cache, bool use_tiled) {
     int head_dim = n_embd / n_head;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     // q, k, v for just this one new token
     std::vector<float> qkv_new(3 * n_embd);
-    linear(x_new, c_attn_w, c_attn_b, qkv_new.data(), 1, n_embd, 3 * n_embd);
+    call_linear(use_tiled, false, x_new, c_attn_w, c_attn_b, qkv_new.data(), 1, n_embd, 3 * n_embd);
     const float* q_new = qkv_new.data();
 
     // append this token's own K, V onto the cache -- it can attend to itself too
@@ -412,7 +412,7 @@ void attention_decode(const float* x_new, const float* c_attn_w, const float* c_
         }
     }
 
-    linear(concat.data(), c_proj_w, c_proj_b, out, 1, n_embd, n_embd);
+    call_linear(use_tiled, false, concat.data(), c_proj_w, c_proj_b, out, 1, n_embd, n_embd);
 }
 
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
@@ -471,7 +471,7 @@ void transformer_block_decode(float* x_new, const std::unordered_map<std::string
                       weights.at(prefix + "attn.c_attn.bias").data.data(),
                       weights.at(prefix + "attn.c_proj.weight").data.data(),
                       weights.at(prefix + "attn.c_proj.bias").data.data(),
-                      attn_out.data(), n_embd, n_head, cache);
+                      attn_out.data(), n_embd, n_head, cache, use_tiled);
 
     for (int i = 0; i < n_embd; ++i) {
         x_new[i] += attn_out[i];
