@@ -1,4 +1,5 @@
 #pragma once
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +55,18 @@ int argmax(const float* logits, int vocab_size);
 // exactly like plain argmax()
 int pick_next_token(const float* logits, int vocab_size,
                      const std::vector<int>& ids, int ngram_size);
+
+// randomly samples a next token instead of always taking the top pick --
+// this is what makes production LLMs (ChatGPT, Claude) give different
+// answers to the same prompt on different runs, real greedy decoding never
+// varies. restricts sampling to the top_k highest-probability tokens first
+// (so it never picks something absurd from the long tail), then samples
+// from those weighted by softmax(logits / temperature). higher temperature
+// = more random, lower = closer to greedy. same n-gram repeat block as
+// pick_next_token(). rng is passed in so the caller controls the seed --
+// seed it once per generation, not per token, or draws become correlated
+int sample_next_token(const float* logits, int vocab_size, const std::vector<int>& ids,
+                       int ngram_size, float temperature, int top_k, std::mt19937& rng);
 
 // A, B are the two input matrices, C is the output matrix
 // M = number of rows in A, K = number of columns in A (and rows in B), N = number of columns in B
@@ -144,11 +157,16 @@ void transformer_block_decode(float* x_new, const std::unordered_map<std::string
 // returns: prompt_ids followed by num_new_tokens generated ids
 // no_repeat_ngram_size: 0 disables (pure greedy, matches HF exactly); a
 //   positive value (e.g. 3) blocks repeated n-grams, see pick_next_token()
+// temperature: 0 disables sampling entirely (pure greedy, deterministic,
+//   matches HF exactly); > 0 samples instead (see sample_next_token()) --
+//   different every run, seeded internally from a random device each call
+// top_k: only used when temperature > 0, restricts sampling to the top_k
+//   highest-probability tokens
 std::vector<int> generate(const std::vector<int>& prompt_ids,
                            const std::unordered_map<std::string, Tensor>& weights,
                            int n_embd, int n_head, int n_layer, float eps,
                            int num_new_tokens, bool use_tiled = false, bool use_threaded = false,
-                           int no_repeat_ngram_size = 0);
+                           int no_repeat_ngram_size = 0, float temperature = 0.0f, int top_k = 40);
 
 // same generation, but KV-cached: the prompt is processed once (prefill,
 // populating the cache), then each new token only computes its own Q/K/V and
@@ -159,8 +177,9 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
 // nothing to split across threads)
 // no_repeat_ngram_size: 0 disables (pure greedy, matches generate() exactly);
 //   a positive value (e.g. 3) blocks repeated n-grams, see pick_next_token()
+// temperature/top_k: same as generate(), see above
 std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
                                   const std::unordered_map<std::string, Tensor>& weights,
                                   int n_embd, int n_head, int n_layer, float eps,
                                   int num_new_tokens, bool use_tiled = false, bool use_threaded = false,
-                                  int no_repeat_ngram_size = 0);
+                                  int no_repeat_ngram_size = 0, float temperature = 0.0f, int top_k = 40);

@@ -8,6 +8,8 @@ sees text, only token ids, and does zero ML-framework work at inference time.
 
 Usage:
     python3 chat.py "Once upon a time" --num-new 20
+    python3 chat.py "Once upon a time" --num-new 20 --temperature 0.8   # varies each run
+    python3 chat.py "Once upon a time" --num-new 20 --temperature 0    # deterministic (default)
 """
 import argparse
 import os
@@ -35,6 +37,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("prompt", help="text prompt to continue")
     parser.add_argument("--num-new", type=int, default=20, help="number of new tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.8,
+                         help="0 = deterministic greedy (matches PyTorch exactly every time); "
+                              "> 0 = random sampling, varies each run, higher = more random")
     args = parser.parse_args()
 
     if not GENERATE_BIN.exists():
@@ -44,7 +49,7 @@ def main():
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     prompt_ids = tokenizer.encode(args.prompt)
 
-    cmd = [str(GENERATE_BIN), str(args.num_new)] + [str(i) for i in prompt_ids]
+    cmd = [str(GENERATE_BIN), str(args.num_new), str(args.temperature)] + [str(i) for i in prompt_ids]
     result = subprocess.run(cmd, cwd=BUILD_DIR, capture_output=True, text=True)
     if result.returncode != 0:
         print("generate binary failed:", result.stderr, file=sys.stderr)

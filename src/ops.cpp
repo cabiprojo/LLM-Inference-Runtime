@@ -93,19 +93,17 @@ int argmax(const float* logits, int vocab_size) {
     return best;
 }
 
-int pick_next_token(const float* logits, int vocab_size,
-                     const std::vector<int>& ids, int ngram_size) {
-    int prefix_len = ngram_size - 1;
-    if (ngram_size <= 0 || static_cast<int>(ids.size()) < prefix_len) {
-        return argmax(logits, vocab_size);
-    }
+namespace {
 
-    // the most recent (ngram_size - 1) tokens -- the "prefix" about to be extended
-    const int* prefix = ids.data() + ids.size() - prefix_len;
-
-    // every token that has already followed this exact prefix before -- picking
-    // any of them again would recreate an n-gram already generated earlier
+// tokens that have already followed the most recent (ngram_size-1) tokens
+// before -- picking any of them again would recreate an n-gram already seen.
+// shared by pick_next_token() and sample_next_token()
+std::unordered_set<int> banned_ngram_tokens(const std::vector<int>& ids, int ngram_size) {
     std::unordered_set<int> banned;
+    int prefix_len = ngram_size - 1;
+    if (ngram_size <= 0 || static_cast<int>(ids.size()) < prefix_len) return banned;
+
+    const int* prefix = ids.data() + ids.size() - prefix_len;
     for (int i = 0; i + ngram_size <= static_cast<int>(ids.size()); ++i) {
         bool matches = true;
         for (int k = 0; k < prefix_len; ++k) {
@@ -113,7 +111,14 @@ int pick_next_token(const float* logits, int vocab_size,
         }
         if (matches) banned.insert(ids[i + prefix_len]);
     }
+    return banned;
+}
 
+}  // namespace
+
+int pick_next_token(const float* logits, int vocab_size,
+                     const std::vector<int>& ids, int ngram_size) {
+    std::unordered_set<int> banned = banned_ngram_tokens(ids, ngram_size);
     if (banned.empty()) return argmax(logits, vocab_size);
 
     int best = -1;
@@ -122,6 +127,48 @@ int pick_next_token(const float* logits, int vocab_size,
         if (best == -1 || logits[i] > logits[best]) best = i;
     }
     return best;
+}
+
+int sample_next_token(const float* logits, int vocab_size, const std::vector<int>& ids,
+                       int ngram_size, float temperature, int top_k, std::mt19937& rng) {
+    std::unordered_set<int> banned = banned_ngram_tokens(ids, ngram_size);
+
+    // find the top_k highest-probability candidates (excluding banned ones)
+    // by repeatedly picking the best remaining -- top_k is small (tens), so
+    // this simple O(top_k * vocab_size) approach is plenty fast here
+    std::vector<int> candidates;
+    std::vector<bool> taken(vocab_size, false);
+    for (int k = 0; k < top_k; ++k) {
+        int best = -1;
+        for (int i = 0; i < vocab_size; ++i) {
+            if (taken[i] || banned.count(i)) continue;
+            if (best == -1 || logits[i] > logits[best]) best = i;
+        }
+        if (best == -1) break;  // fewer than top_k valid candidates left
+        candidates.push_back(best);
+        taken[best] = true;
+    }
+
+    // softmax over just those candidates, scaled by temperature
+    float max_logit = logits[candidates[0]];
+    for (int c : candidates) max_logit = std::max(max_logit, logits[c]);
+
+    std::vector<float> probs(candidates.size());
+    float sum = 0.0f;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        probs[i] = std::exp((logits[candidates[i]] - max_logit) / temperature);
+        sum += probs[i];
+    }
+
+    // sample one candidate, weighted by its probability
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float r = dist(rng);
+    float cumulative = 0.0f;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        cumulative += probs[i];
+        if (r <= cumulative) return candidates[i];
+    }
+    return candidates.back();  // fallback for floating-point edge cases
 }
 
 void matmul(const float* A, const float* B, float* C, int M, int K, int N) {
@@ -537,10 +584,12 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
                            const std::unordered_map<std::string, Tensor>& weights,
                            int n_embd, int n_head, int n_layer, float eps,
                            int num_new_tokens, bool use_tiled, bool use_threaded,
-                           int no_repeat_ngram_size) {
+                           int no_repeat_ngram_size, float temperature, int top_k) {
     std::vector<int> ids = prompt_ids;
     const int vocab_size = weights.at("wte").shape[0];
     std::vector<float> zero_bias(vocab_size, 0.0f);
+    std::random_device rd;
+    std::mt19937 rng(rd());  // seeded fresh each call -- different every run
 
     for (int step = 0; step < num_new_tokens; ++step) {
         int seq_len = static_cast<int>(ids.size());
@@ -567,7 +616,9 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
         linear(last_row, weights.at("wte").data.data(), zero_bias.data(),
                logits.data(), 1, n_embd, vocab_size);
 
-        int next_id = pick_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size);
+        int next_id = temperature > 0.0f
+            ? sample_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size, temperature, top_k, rng)
+            : pick_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size);
         ids.push_back(next_id);
     }
 
@@ -578,7 +629,7 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
                                   const std::unordered_map<std::string, Tensor>& weights,
                                   int n_embd, int n_head, int n_layer, float eps,
                                   int num_new_tokens, bool use_tiled, bool use_threaded,
-                                  int no_repeat_ngram_size) {
+                                  int no_repeat_ngram_size, float temperature, int top_k) {
     std::vector<int> ids = prompt_ids;
     if (num_new_tokens <= 0) return ids;
 
@@ -586,6 +637,8 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
     std::vector<float> zero_bias(vocab_size, 0.0f);
     const int prompt_len = static_cast<int>(prompt_ids.size());
     std::vector<LayerKVCache> cache(n_layer);
+    std::random_device rd;
+    std::mt19937 rng(rd());  // seeded fresh each call -- different every run
 
     // prefill: process the whole prompt in one pass, populating every layer's
     // cache, then pick the first new token from the prompt's last position.
@@ -609,7 +662,9 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
     std::vector<float> logits(vocab_size);
     linear(last_row, weights.at("wte").data.data(), zero_bias.data(),
            logits.data(), 1, n_embd, vocab_size);
-    ids.push_back(pick_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size));
+    ids.push_back(temperature > 0.0f
+        ? sample_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size, temperature, top_k, rng)
+        : pick_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size));
 
     // decode: one new token at a time, reusing the cache instead of recomputing
     // the whole sequence -- this is the loop that's actually fast
@@ -635,7 +690,9 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
         std::vector<float> logits_new(vocab_size);
         linear(final_ln_new.data(), weights.at("wte").data.data(), zero_bias.data(),
                logits_new.data(), 1, n_embd, vocab_size);
-        ids.push_back(pick_next_token(logits_new.data(), vocab_size, ids, no_repeat_ngram_size));
+        ids.push_back(temperature > 0.0f
+            ? sample_next_token(logits_new.data(), vocab_size, ids, no_repeat_ngram_size, temperature, top_k, rng)
+            : pick_next_token(logits_new.data(), vocab_size, ids, no_repeat_ngram_size));
     }
 
     return ids;
