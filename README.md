@@ -76,6 +76,10 @@ Two real bugs turned up while trying to make that demo actually fast to run. Fir
 
 Second, and unrelated to the C++ side entirely: the demo itself took up to two minutes to start, even after fixing an unnecessary network call. Turned out `import transformers` alone took 43 seconds, because the Python venv lived on the Windows-mounted drive this project sits on, and WSL2 is slow at the "open thousands of small files" pattern that importing a big package involves. Same import from a venv on native Linux filesystem took about 1 second. Since `chat.py` only ever uses the tokenizer, never the actual model, it doesn't need torch at all, so `python/setup_chat_venv.sh` sets up a small, torch-free venv on native filesystem just for the demo. Startup went from ~90-120 seconds to about 9.5 seconds.
 
+Two more things came out of actually using the demo instead of just benchmarking it. First, greedy decoding has no randomness anywhere, so once it starts a phrase like "I'm not sure if it's because I'm a little bit of a nerd," the highest-probability continuation is often just to say something very similar again, and it loops. `pick_next_token()` now tracks n-grams already generated and refuses to pick a token that would recreate one, falling back to the next-best option instead. Still fully deterministic, no randomness added, just blocks exact repeats.
+
+Second, and this one's a genuinely interesting distinction: real products like ChatGPT give different answers to the same prompt on different runs, but the underlying model computation is deterministic in every LLM, always has been. What varies is the decoding strategy layered on top. Greedy always takes the single best token (reproducible, which is exactly what let me validate against HuggingFace byte-for-byte). Sampling instead draws randomly from the model's probability distribution, weighted by probability, which is what gives production chatbots their variety. Added `sample_next_token()`, which restricts candidates to the top 40 highest-probability tokens then samples from those at a given temperature. `generate()`/`generate_cached()` still default to temperature 0 (pure greedy, unchanged, still matches HuggingFace exactly), but `chat.py` now defaults to temperature 0.8, so the demo gives a different, still-coherent answer each time, same as a real product would.
+
 ### Stage 5: multithreading
 
 Everything up to this point ran on a single CPU core. `matmul`'s output rows are completely independent of each other though: computing row 5 never reads or writes anything row 12 touches. That independence means I can hand different rows to different threads and never worry about two threads stepping on the same memory, no locks needed anywhere.
@@ -113,6 +117,7 @@ cmake --build build
 # the thousands of small files a big package import touches, across drives)
 cd python && bash setup_chat_venv.sh
 ~/chat_demo_venv/bin/python chat.py "Once upon a time" --num-new 20
+# --temperature 0 for the deterministic version instead (matches PyTorch exactly)
 
 # how does it compare to plain PyTorch on CPU?
 cd python && python3 benchmark_pytorch.py
