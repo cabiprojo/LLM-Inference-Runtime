@@ -57,6 +57,17 @@ int main() {
     std::cout << (cache_match ? "[PASS] " : "[FAIL] ")
                << "generate_cached() matches generate() exactly\n";
 
+    // the repetition guard is a separate feature from caching -- confirm
+    // generate() and generate_cached() still agree with each other once
+    // it's turned on, same discipline as every other optimization here
+    std::vector<int> no_repeat = generate(prompt, weights, n_embd, n_head, n_layer, eps,
+                                           num_new_tokens, false, false, /*no_repeat_ngram_size=*/3);
+    std::vector<int> no_repeat_cached = generate_cached(prompt, weights, n_embd, n_head, n_layer, eps,
+                                                         num_new_tokens, false, false, 3);
+    bool no_repeat_match = (no_repeat == no_repeat_cached);
+    std::cout << (no_repeat_match ? "[PASS] " : "[FAIL] ")
+               << "generate_cached() with no_repeat_ngram_size=3 matches generate() with the same setting\n";
+
     // real timing comparison, on a longer generation where the difference
     // between "recompute everything" and "reuse the cache" actually shows up
     const int bench_new_tokens = 20;

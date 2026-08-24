@@ -5,6 +5,7 @@
 #include <immintrin.h>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 void layer_norm(const float* x, const float* gamma, const float* beta,
@@ -88,6 +89,37 @@ int argmax(const float* logits, int vocab_size) {
     int best = 0;
     for (int i = 1; i < vocab_size; ++i) {
         if (logits[i] > logits[best]) best = i;
+    }
+    return best;
+}
+
+int pick_next_token(const float* logits, int vocab_size,
+                     const std::vector<int>& ids, int ngram_size) {
+    int prefix_len = ngram_size - 1;
+    if (ngram_size <= 0 || static_cast<int>(ids.size()) < prefix_len) {
+        return argmax(logits, vocab_size);
+    }
+
+    // the most recent (ngram_size - 1) tokens -- the "prefix" about to be extended
+    const int* prefix = ids.data() + ids.size() - prefix_len;
+
+    // every token that has already followed this exact prefix before -- picking
+    // any of them again would recreate an n-gram already generated earlier
+    std::unordered_set<int> banned;
+    for (int i = 0; i + ngram_size <= static_cast<int>(ids.size()); ++i) {
+        bool matches = true;
+        for (int k = 0; k < prefix_len; ++k) {
+            if (ids[i + k] != prefix[k]) { matches = false; break; }
+        }
+        if (matches) banned.insert(ids[i + prefix_len]);
+    }
+
+    if (banned.empty()) return argmax(logits, vocab_size);
+
+    int best = -1;
+    for (int i = 0; i < vocab_size; ++i) {
+        if (banned.count(i)) continue;
+        if (best == -1 || logits[i] > logits[best]) best = i;
     }
     return best;
 }
@@ -504,7 +536,8 @@ void transformer_block_decode(float* x_new, const std::unordered_map<std::string
 std::vector<int> generate(const std::vector<int>& prompt_ids,
                            const std::unordered_map<std::string, Tensor>& weights,
                            int n_embd, int n_head, int n_layer, float eps,
-                           int num_new_tokens, bool use_tiled, bool use_threaded) {
+                           int num_new_tokens, bool use_tiled, bool use_threaded,
+                           int no_repeat_ngram_size) {
     std::vector<int> ids = prompt_ids;
     const int vocab_size = weights.at("wte").shape[0];
     std::vector<float> zero_bias(vocab_size, 0.0f);
@@ -534,7 +567,7 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
         linear(last_row, weights.at("wte").data.data(), zero_bias.data(),
                logits.data(), 1, n_embd, vocab_size);
 
-        int next_id = argmax(logits.data(), vocab_size);
+        int next_id = pick_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size);
         ids.push_back(next_id);
     }
 
@@ -544,7 +577,8 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
 std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
                                   const std::unordered_map<std::string, Tensor>& weights,
                                   int n_embd, int n_head, int n_layer, float eps,
-                                  int num_new_tokens, bool use_tiled, bool use_threaded) {
+                                  int num_new_tokens, bool use_tiled, bool use_threaded,
+                                  int no_repeat_ngram_size) {
     std::vector<int> ids = prompt_ids;
     if (num_new_tokens <= 0) return ids;
 
@@ -575,7 +609,7 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
     std::vector<float> logits(vocab_size);
     linear(last_row, weights.at("wte").data.data(), zero_bias.data(),
            logits.data(), 1, n_embd, vocab_size);
-    ids.push_back(argmax(logits.data(), vocab_size));
+    ids.push_back(pick_next_token(logits.data(), vocab_size, ids, no_repeat_ngram_size));
 
     // decode: one new token at a time, reusing the cache instead of recomputing
     // the whole sequence -- this is the loop that's actually fast
@@ -601,7 +635,7 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
         std::vector<float> logits_new(vocab_size);
         linear(final_ln_new.data(), weights.at("wte").data.data(), zero_bias.data(),
                logits_new.data(), 1, n_embd, vocab_size);
-        ids.push_back(argmax(logits_new.data(), vocab_size));
+        ids.push_back(pick_next_token(logits_new.data(), vocab_size, ids, no_repeat_ngram_size));
     }
 
     return ids;

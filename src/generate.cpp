@@ -30,9 +30,13 @@ int main(int argc, char** argv) {
     // use_tiled=true here matters a lot: decode runs once per generated
     // token and dominates total generation time, so this is what actually
     // turns on the cache-aware linear() path for the demo, not just the
-    // isolated benchmarks
+    // isolated benchmarks.
+    // no_repeat_ngram_size=3: plain greedy decoding has no randomness to
+    // break out of a loop once it starts repeating a phrase, this blocks
+    // exact repeats without giving up determinism
     std::vector<int> result = generate_cached(prompt, weights, n_embd, n_head, n_layer, eps,
-                                               num_new_tokens, /*use_tiled=*/true);
+                                               num_new_tokens, /*use_tiled=*/true,
+                                               /*use_threaded=*/false, /*no_repeat_ngram_size=*/3);
 
     for (size_t i = 0; i < result.size(); ++i) {
         std::cout << result[i] << (i + 1 < result.size() ? " " : "\n");

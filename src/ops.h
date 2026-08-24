@@ -46,6 +46,15 @@ void causal_softmax(float* scores, int seq_len);
 // greedy next-token pick
 int argmax(const float* logits, int vocab_size);
 
+// same as argmax(), but never picks a token that would recreate an n-gram
+// (ngram_size consecutive tokens) already present earlier in ids. greedy
+// decoding alone tends to loop into repeated phrases with no randomness to
+// break out -- this blocks the exact repeats without adding any randomness,
+// so it stays deterministic. ngram_size <= 0 disables this and behaves
+// exactly like plain argmax()
+int pick_next_token(const float* logits, int vocab_size,
+                     const std::vector<int>& ids, int ngram_size);
+
 // A, B are the two input matrices, C is the output matrix
 // M = number of rows in A, K = number of columns in A (and rows in B), N = number of columns in B
 void matmul(const float* A, const float* B, float* C, int M, int K, int N);
@@ -133,10 +142,13 @@ void transformer_block_decode(float* x_new, const std::unordered_map<std::string
 // n_embd, n_head, n_layer, eps: model config (768, 12, 12, 1e-5 for GPT-2 small)
 // num_new_tokens: how many additional tokens to generate
 // returns: prompt_ids followed by num_new_tokens generated ids
+// no_repeat_ngram_size: 0 disables (pure greedy, matches HF exactly); a
+//   positive value (e.g. 3) blocks repeated n-grams, see pick_next_token()
 std::vector<int> generate(const std::vector<int>& prompt_ids,
                            const std::unordered_map<std::string, Tensor>& weights,
                            int n_embd, int n_head, int n_layer, float eps,
-                           int num_new_tokens, bool use_tiled = false, bool use_threaded = false);
+                           int num_new_tokens, bool use_tiled = false, bool use_threaded = false,
+                           int no_repeat_ngram_size = 0);
 
 // same generation, but KV-cached: the prompt is processed once (prefill,
 // populating the cache), then each new token only computes its own Q/K/V and
@@ -145,7 +157,10 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
 // generate() for the same inputs -- this is a speed optimization only.
 // use_threaded speeds up the prefill pass only (decode is a single row --
 // nothing to split across threads)
+// no_repeat_ngram_size: 0 disables (pure greedy, matches generate() exactly);
+//   a positive value (e.g. 3) blocks repeated n-grams, see pick_next_token()
 std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
                                   const std::unordered_map<std::string, Tensor>& weights,
                                   int n_embd, int n_head, int n_layer, float eps,
-                                  int num_new_tokens, bool use_tiled = false, bool use_threaded = false);
+                                  int num_new_tokens, bool use_tiled = false, bool use_threaded = false,
+                                  int no_repeat_ngram_size = 0);
