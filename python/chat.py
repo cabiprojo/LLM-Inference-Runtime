@@ -20,6 +20,11 @@ from pathlib import Path
 # home just to load them. this is what was causing the slow startup.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
+# this venv is deliberately torch-free (chat.py only ever uses the
+# tokenizer, never the actual model) -- silence transformers' notice about
+# that, it's expected, not a problem
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 from transformers import GPT2Tokenizer
 
 BUILD_DIR = Path(__file__).resolve().parent.parent / "build"
