@@ -139,16 +139,23 @@ int main() {
           activations.at("block_0_attn").data.data(), seq_len * n_embd);
 
     // test 6: full forward pass, embed -> 12 blocks -> final ln -> logits
-    // run twice -- naive and tiled -- both checked against the real reference
-    // checkpoints, proving the tiled path is correct in the actual model,
-    // not just on the synthetic random data bench_matmul used
+    // run three ways -- naive, tiled, threaded -- all checked against the
+    // real reference checkpoints, proving each path is correct in the actual
+    // model, not just on the synthetic random data bench_matmul used
     const int n_layer = 12;
     const float eps = 1e-5f;
     const int vocab_size = weights.at("wte").shape[0];
     std::vector<float> zero_bias(vocab_size, 0.0f);
 
-    for (bool use_tiled : {false, true}) {
-        const std::string tag = use_tiled ? "[tiled] " : "[naive] ";
+    struct Mode { const char* tag; bool use_tiled; bool use_threaded; };
+    Mode modes[] = {
+        {"[naive] ", false, false},
+        {"[tiled] ", true, false},
+        {"[threaded] ", true, true},
+    };
+
+    for (const auto& mode : modes) {
+        const std::string tag = mode.tag;
 
         std::vector<float> x(seq_len * n_embd);
         embed(input_ids.data(), weights.at("wte").data.data(), weights.at("wpe").data.data(),
@@ -156,7 +163,8 @@ int main() {
 
         for (int layer = 0; layer < n_layer; ++layer) {
             std::string prefix = "h." + std::to_string(layer) + ".";
-            transformer_block(x.data(), weights, prefix, seq_len, n_embd, n_head, eps, use_tiled);
+            transformer_block(x.data(), weights, prefix, seq_len, n_embd, n_head, eps,
+                               mode.use_tiled, nullptr, mode.use_threaded);
         }
         std::string ref_name = "block_" + std::to_string(n_layer - 1) + "_out";
         check(tag + "block_11_out", x.data(), activations.at(ref_name).data.data(), seq_len * n_embd);
@@ -174,16 +182,16 @@ int main() {
               seq_len * vocab_size);
     }
 
-    // test 7: real timing of the actual engine, naive vs tiled -- the real
-    // test sentence is only 6 tokens, too short to show a meaningful timing
-    // difference, so this uses a longer synthetic input (real weights, made-up
-    // token ids) purely to measure wall-clock speed, not correctness
+    // test 7: real timing of the actual engine, naive vs tiled vs threaded --
+    // the real test sentence is only 6 tokens, too short to show a meaningful
+    // timing difference, so this uses a longer synthetic input (real weights,
+    // made-up token ids) purely to measure wall-clock speed, not correctness
     std::cout << "\ntiming: full 12-block forward pass, seq_len=64 (synthetic input, real weights)\n";
     const int bench_seq_len = 64;
     std::vector<int> bench_ids(bench_seq_len);
     for (int i = 0; i < bench_seq_len; ++i) bench_ids[i] = i % 1000;
 
-    for (bool use_tiled : {false, true}) {
+    for (const auto& mode : modes) {
         std::vector<float> x(bench_seq_len * n_embd);
         embed(bench_ids.data(), weights.at("wte").data.data(), weights.at("wpe").data.data(),
               x.data(), bench_seq_len, n_embd);
@@ -191,12 +199,13 @@ int main() {
         auto start = std::chrono::high_resolution_clock::now();
         for (int layer = 0; layer < n_layer; ++layer) {
             std::string prefix = "h." + std::to_string(layer) + ".";
-            transformer_block(x.data(), weights, prefix, bench_seq_len, n_embd, n_head, eps, use_tiled);
+            transformer_block(x.data(), weights, prefix, bench_seq_len, n_embd, n_head, eps,
+                               mode.use_tiled, nullptr, mode.use_threaded);
         }
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double>(end - start).count() * 1000.0;
 
-        std::cout << "  " << (use_tiled ? "tiled: " : "naive: ") << ms << " ms\n";
+        std::cout << "  " << mode.tag << ms << " ms\n";
     }
 
     return 0;

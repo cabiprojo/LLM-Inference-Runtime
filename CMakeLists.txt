@@ -13,11 +13,14 @@ endif()
 # the auto-vectorization we just measured actually happens in the real build
 add_compile_options(-march=native)
 
+find_package(Threads REQUIRED)
+
 add_library(ops STATIC
     src/ops.cpp
     src/io/tensor_io.cpp
 )
 target_include_directories(ops PUBLIC src)
+target_link_libraries(ops PUBLIC Threads::Threads)
 
 add_executable(gpt2 src/main.cpp)
 target_link_libraries(gpt2 PRIVATE ops)

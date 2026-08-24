@@ -56,6 +56,12 @@ void matmul_tiled(const float* A, const float* B, float* C, int M, int K, int N,
 // same result as matmul_tiled(), inner loop vectorized 8-wide with AVX2
 void matmul_simd(const float* A, const float* B, float* C, int M, int K, int N, int TILE);
 
+// same result as matmul_simd(), with the M output rows split across
+// num_threads threads (each running matmul_simd on its own disjoint chunk of
+// rows) -- no locks needed since no two threads ever write the same row of C
+void matmul_threaded(const float* A, const float* B, float* C, int M, int K, int N,
+                      int TILE, int num_threads);
+
 // out = x @ W^T + b
 // x: (seq_len, in_features), W: (out_features, in_features), b: (out_features)
 // out: (seq_len, out_features)
@@ -65,6 +71,12 @@ void linear(const float* x, const float* W, const float* b,
 // same result as linear(), computed TILE x TILE block at a time for cache reuse
 void linear_tiled(const float* x, const float* W, const float* b,
                    float* out, int seq_len, int in_features, int out_features, int TILE);
+
+// same result as linear_tiled(), with the seq_len rows split across
+// num_threads threads, same disjoint-output-rows approach as matmul_threaded
+void linear_threaded(const float* x, const float* W, const float* b,
+                      float* out, int seq_len, int in_features, int out_features,
+                      int TILE, int num_threads);
 
 // per-layer K/V history for KV-cache generation. K and V grow by one row
 // (n_embd floats) each time a new token is processed, whether via prefill
@@ -81,12 +93,14 @@ struct LayerKVCache {
 // c_proj_w: (n_embd, n_embd), c_proj_b: (n_embd), output projection
 // out: (seq_len, n_embd)
 // use_tiled: if true, internal linear() calls use linear_tiled(TILE=16) instead
+// use_threaded: if true, internal linear() calls use linear_threaded() instead
+//   (takes priority over use_tiled, since threaded already runs tiled internally)
 // cache: if non-null, this call's K/V (for every position in x) are appended
 //   to it -- used for prefill, populating the cache from the initial prompt
 void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
                const float* c_proj_w, const float* c_proj_b,
                float* out, int seq_len, int n_embd, int n_head, bool use_tiled = false,
-               LayerKVCache* cache = nullptr);
+               LayerKVCache* cache = nullptr, bool use_threaded = false);
 
 // attention for exactly one new token, using and extending a KV-cache instead
 // of recomputing K/V for the whole sequence. x_new: (1, n_embd). appends this
@@ -100,9 +114,10 @@ void attention_decode(const float* x_new, const float* c_attn_w, const float* c_
 // ln_1 -> attention -> residual add -> ln_2 -> mlp -> residual add
 // prefix selects this block's weights, e.g. "h.0."
 // use_tiled: if true, every internal linear() call uses linear_tiled(TILE=16) instead
+// use_threaded: if true, every internal linear() call uses linear_threaded() instead
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
                         const std::string& prefix, int seq_len, int n_embd, int n_head, float eps,
-                        bool use_tiled = false, LayerKVCache* cache = nullptr);
+                        bool use_tiled = false, LayerKVCache* cache = nullptr, bool use_threaded = false);
 
 // one transformer block for exactly one new token, using and extending cache.
 // x_new: (1, n_embd), updated in place to become this block's output for the new token
@@ -121,14 +136,16 @@ void transformer_block_decode(float* x_new, const std::unordered_map<std::string
 std::vector<int> generate(const std::vector<int>& prompt_ids,
                            const std::unordered_map<std::string, Tensor>& weights,
                            int n_embd, int n_head, int n_layer, float eps,
-                           int num_new_tokens, bool use_tiled = false);
+                           int num_new_tokens, bool use_tiled = false, bool use_threaded = false);
 
 // same generation, but KV-cached: the prompt is processed once (prefill,
 // populating the cache), then each new token only computes its own Q/K/V and
 // attends against the accumulated cache instead of recomputing the whole
 // sequence from scratch every step. Must produce identical output to
 // generate() for the same inputs -- this is a speed optimization only.
+// use_threaded speeds up the prefill pass only (decode is a single row --
+// nothing to split across threads)
 std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
                                   const std::unordered_map<std::string, Tensor>& weights,
                                   int n_embd, int n_head, int n_layer, float eps,
-                                  int num_new_tokens, bool use_tiled = false);
+                                  int num_new_tokens, bool use_tiled = false, bool use_threaded = false);

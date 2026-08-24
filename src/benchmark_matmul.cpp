@@ -81,6 +81,25 @@ void check_simd_correctness(int M, int K, int N, int tile) {
                << ", max abs diff = " << max_diff << "\n";
 }
 
+// confirms matmul_threaded produces the same result as matmul, just parallelized
+void check_threaded_correctness(int M, int K, int N, int tile, int num_threads) {
+    std::mt19937 rng(17);
+    std::vector<float> A(M * K), B(K * N), C_naive(M * N), C_threaded(M * N);
+    fill_random(A, rng);
+    fill_random(B, rng);
+
+    matmul(A.data(), B.data(), C_naive.data(), M, K, N);
+    matmul_threaded(A.data(), B.data(), C_threaded.data(), M, K, N, tile, num_threads);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < M * N; ++i) {
+        max_diff = std::max(max_diff, std::fabs(C_naive[i] - C_threaded[i]));
+    }
+    std::cout << (max_diff < 1e-3f ? "[PASS] " : "[FAIL] ")
+               << "matmul_threaded matches matmul, threads=" << num_threads
+               << ", max abs diff = " << max_diff << "\n";
+}
+
 // confirms linear_tiled produces the same result as linear, just reordered
 void check_linear_correctness(int seq_len, int in_features, int out_features, int tile) {
     std::mt19937 rng(11);
@@ -169,6 +188,19 @@ int main() {
 
     std::cout << "\n";
 
+    // multithreading, on top of tiling+SIMD -- must still match matmul exactly.
+    // M=64 rows split across threads, so thread counts beyond 64 don't help
+    check_threaded_correctness(64, 768, 3072, 16, 4);
+    check_threaded_correctness(64, 768, 3072, 16, 8);
+    benchmark("matmul_threaded(4)   ", [](const float* A, const float* B, float* C, int M, int K, int N) {
+        matmul_threaded(A, B, C, M, K, N, 16, 4);
+    }, M, K, N, 20);
+    benchmark("matmul_threaded(8)   ", [](const float* A, const float* B, float* C, int M, int K, int N) {
+        matmul_threaded(A, B, C, M, K, N, 16, 8);
+    }, M, K, N, 20);
+
+    std::cout << "\n";
+
     // linear() is what actually does the heavy work in the real model --
     // this checks correctness, then projects a full 12-block forward pass
     // worth of linear() calls, naive vs tiled, using the real GPT-2 small shapes
@@ -180,6 +212,10 @@ int main() {
     const LinearFn linear_16 = [](const float* x, const float* W, const float* b, float* out,
                                     int seq_len, int in_features, int out_features) {
         linear_tiled(x, W, b, out, seq_len, in_features, out_features, 16);
+    };
+    const LinearFn linear_16_threaded4 = [](const float* x, const float* W, const float* b, float* out,
+                                              int seq_len, int in_features, int out_features) {
+        linear_threaded(x, W, b, out, seq_len, in_features, out_features, 16, 4);
     };
 
     // the four linear() calls inside one transformer_block, in order
@@ -205,11 +241,22 @@ int main() {
         tiled_block_seconds += time_linear(linear_16, seq_len, s.in_features, s.out_features, 20);
     }
 
+    std::cout << "threaded linear_threaded(TILE=16, 4 threads) per shape:\n";
+    double threaded_block_seconds = 0.0;
+    for (const auto& s : shapes) {
+        std::cout << "  " << s.name;
+        threaded_block_seconds += time_linear(linear_16_threaded4, seq_len, s.in_features, s.out_features, 20);
+    }
+
     std::cout << "\none block: naive " << naive_block_seconds * 1000.0 << " ms, tiled "
-               << tiled_block_seconds * 1000.0 << " ms\n";
+               << tiled_block_seconds * 1000.0 << " ms, threaded "
+               << threaded_block_seconds * 1000.0 << " ms\n";
     std::cout << "projected 12 blocks: naive " << naive_block_seconds * 12 * 1000.0
-               << " ms, tiled " << tiled_block_seconds * 12 * 1000.0 << " ms\n";
-    std::cout << "speedup: " << naive_block_seconds / tiled_block_seconds << "x\n";
+               << " ms, tiled " << tiled_block_seconds * 12 * 1000.0
+               << " ms, threaded " << threaded_block_seconds * 12 * 1000.0 << " ms\n";
+    std::cout << "speedup, tiled vs naive: " << naive_block_seconds / tiled_block_seconds << "x\n";
+    std::cout << "speedup, threaded vs tiled: " << tiled_block_seconds / threaded_block_seconds << "x\n";
+    std::cout << "speedup, threaded vs naive: " << naive_block_seconds / threaded_block_seconds << "x\n";
 
     return 0;
 }

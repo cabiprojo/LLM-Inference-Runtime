@@ -4,6 +4,7 @@
 #include <cmath>
 #include <immintrin.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 void layer_norm(const float* x, const float* gamma, const float* beta,
@@ -174,6 +175,27 @@ void matmul_simd(const float* A, const float* B, float* C, int M, int K, int N, 
     }
 }
 
+void matmul_threaded(const float* A, const float* B, float* C, int M, int K, int N,
+                      int TILE, int num_threads) {
+    std::vector<std::thread> threads;
+    int rows_per_thread = (M + num_threads - 1) / num_threads;  // ceiling division
+
+    for (int t = 0; t < num_threads; ++t) {
+        int row_start = t * rows_per_thread;
+        int row_end = std::min(row_start + rows_per_thread, M);
+        if (row_start >= row_end) break;  // more threads than rows
+
+        // each thread computes rows [row_start, row_end) of C -- a disjoint
+        // slice, so no two threads ever touch the same memory
+        threads.emplace_back([=]() {
+            matmul_simd(A + row_start * K, B, C + row_start * N,
+                        row_end - row_start, K, N, TILE);
+        });
+    }
+
+    for (auto& t : threads) t.join();
+}
+
 void linear(const float* x, const float* W, const float* b,
             float* out, int seq_len, int in_features, int out_features) {
     for (int i = 0; i < seq_len; ++i) {
@@ -223,13 +245,39 @@ void linear_tiled(const float* x, const float* W, const float* b,
     }
 }
 
+void linear_threaded(const float* x, const float* W, const float* b,
+                      float* out, int seq_len, int in_features, int out_features,
+                      int TILE, int num_threads) {
+    std::vector<std::thread> threads;
+    int rows_per_thread = (seq_len + num_threads - 1) / num_threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        int row_start = t * rows_per_thread;
+        int row_end = std::min(row_start + rows_per_thread, seq_len);
+        if (row_start >= row_end) break;
+
+        // each thread computes rows [row_start, row_end) of out -- a disjoint
+        // slice, W and b are shared read-only across all threads
+        threads.emplace_back([=]() {
+            linear_tiled(x + row_start * in_features, W, b, out + row_start * out_features,
+                         row_end - row_start, in_features, out_features, TILE);
+        });
+    }
+
+    for (auto& t : threads) t.join();
+}
+
 namespace {
 
-// dispatches to linear() or linear_tiled(TILE=16) depending on use_tiled --
-// lets attention()/transformer_block() share one code path for both variants
-void call_linear(bool use_tiled, const float* x, const float* W, const float* b,
+// dispatches to linear(), linear_tiled(), or linear_threaded() depending on
+// use_tiled/use_threaded -- lets attention()/transformer_block() share one
+// code path for all three variants. use_threaded implies tiled internally
+// (linear_threaded calls linear_tiled per thread), so it takes priority.
+void call_linear(bool use_tiled, bool use_threaded, const float* x, const float* W, const float* b,
                   float* out, int seq_len, int in_features, int out_features) {
-    if (use_tiled) {
+    if (use_threaded) {
+        linear_threaded(x, W, b, out, seq_len, in_features, out_features, 16, 4);
+    } else if (use_tiled) {
         linear_tiled(x, W, b, out, seq_len, in_features, out_features, 16);
     } else {
         linear(x, W, b, out, seq_len, in_features, out_features);
@@ -241,13 +289,13 @@ void call_linear(bool use_tiled, const float* x, const float* W, const float* b,
 void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
                const float* c_proj_w, const float* c_proj_b,
                float* out, int seq_len, int n_embd, int n_head, bool use_tiled,
-               LayerKVCache* cache) {
+               LayerKVCache* cache, bool use_threaded) {
     int head_dim = n_embd / n_head;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     // combined q, k, v projection in one linear call
     std::vector<float> qkv(seq_len * 3 * n_embd);
-    call_linear(use_tiled, x, c_attn_w, c_attn_b, qkv.data(), seq_len, n_embd, 3 * n_embd);
+    call_linear(use_tiled, use_threaded, x, c_attn_w, c_attn_b, qkv.data(), seq_len, n_embd, 3 * n_embd);
 
     // prefill: populate the cache with every position's K/V so decode steps
     // afterward don't need to recompute them
@@ -304,7 +352,7 @@ void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
         }
     }
 
-    call_linear(use_tiled, concat.data(), c_proj_w, c_proj_b, out, seq_len, n_embd, n_embd);
+    call_linear(use_tiled, use_threaded, concat.data(), c_proj_w, c_proj_b, out, seq_len, n_embd, n_embd);
 }
 
 void attention_decode(const float* x_new, const float* c_attn_w, const float* c_attn_b,
@@ -369,7 +417,7 @@ void attention_decode(const float* x_new, const float* c_attn_w, const float* c_
 
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
                         const std::string& prefix, int seq_len, int n_embd, int n_head, float eps,
-                        bool use_tiled, LayerKVCache* cache) {
+                        bool use_tiled, LayerKVCache* cache, bool use_threaded) {
     std::vector<float> ln1_out(seq_len * n_embd);
     layer_norm(x, weights.at(prefix + "ln_1.weight").data.data(),
                weights.at(prefix + "ln_1.bias").data.data(),
@@ -381,7 +429,7 @@ void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& 
               weights.at(prefix + "attn.c_attn.bias").data.data(),
               weights.at(prefix + "attn.c_proj.weight").data.data(),
               weights.at(prefix + "attn.c_proj.bias").data.data(),
-              attn_out.data(), seq_len, n_embd, n_head, use_tiled, cache);
+              attn_out.data(), seq_len, n_embd, n_head, use_tiled, cache, use_threaded);
 
     for (int i = 0; i < seq_len * n_embd; ++i) {
         x[i] += attn_out[i];
@@ -394,13 +442,13 @@ void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& 
 
     int mlp_hidden = weights.at(prefix + "mlp.c_fc.weight").shape[0];
     std::vector<float> fc_out(seq_len * mlp_hidden);
-    call_linear(use_tiled, ln2_out.data(), weights.at(prefix + "mlp.c_fc.weight").data.data(),
+    call_linear(use_tiled, use_threaded, ln2_out.data(), weights.at(prefix + "mlp.c_fc.weight").data.data(),
                 weights.at(prefix + "mlp.c_fc.bias").data.data(),
                 fc_out.data(), seq_len, n_embd, mlp_hidden);
     gelu(fc_out.data(), fc_out.data(), seq_len * mlp_hidden);
 
     std::vector<float> mlp_out(seq_len * n_embd);
-    call_linear(use_tiled, fc_out.data(), weights.at(prefix + "mlp.c_proj.weight").data.data(),
+    call_linear(use_tiled, use_threaded, fc_out.data(), weights.at(prefix + "mlp.c_proj.weight").data.data(),
                 weights.at(prefix + "mlp.c_proj.bias").data.data(),
                 mlp_out.data(), seq_len, mlp_hidden, n_embd);
 
@@ -434,15 +482,17 @@ void transformer_block_decode(float* x_new, const std::unordered_map<std::string
                weights.at(prefix + "ln_2.bias").data.data(),
                ln2_out.data(), 1, n_embd, eps);
 
+    // note: no use_threaded here -- this is always a single row (seq_len=1)
+    // during decode, so there's nothing to split across threads
     int mlp_hidden = weights.at(prefix + "mlp.c_fc.weight").shape[0];
     std::vector<float> fc_out(mlp_hidden);
-    call_linear(use_tiled, ln2_out.data(), weights.at(prefix + "mlp.c_fc.weight").data.data(),
+    call_linear(use_tiled, false, ln2_out.data(), weights.at(prefix + "mlp.c_fc.weight").data.data(),
                 weights.at(prefix + "mlp.c_fc.bias").data.data(),
                 fc_out.data(), 1, n_embd, mlp_hidden);
     gelu(fc_out.data(), fc_out.data(), mlp_hidden);
 
     std::vector<float> mlp_out(n_embd);
-    call_linear(use_tiled, fc_out.data(), weights.at(prefix + "mlp.c_proj.weight").data.data(),
+    call_linear(use_tiled, false, fc_out.data(), weights.at(prefix + "mlp.c_proj.weight").data.data(),
                 weights.at(prefix + "mlp.c_proj.bias").data.data(),
                 mlp_out.data(), 1, mlp_hidden, n_embd);
 
@@ -454,7 +504,7 @@ void transformer_block_decode(float* x_new, const std::unordered_map<std::string
 std::vector<int> generate(const std::vector<int>& prompt_ids,
                            const std::unordered_map<std::string, Tensor>& weights,
                            int n_embd, int n_head, int n_layer, float eps,
-                           int num_new_tokens, bool use_tiled) {
+                           int num_new_tokens, bool use_tiled, bool use_threaded) {
     std::vector<int> ids = prompt_ids;
     const int vocab_size = weights.at("wte").shape[0];
     std::vector<float> zero_bias(vocab_size, 0.0f);
@@ -468,7 +518,8 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
 
         for (int layer = 0; layer < n_layer; ++layer) {
             std::string prefix = "h." + std::to_string(layer) + ".";
-            transformer_block(x.data(), weights, prefix, seq_len, n_embd, n_head, eps, use_tiled);
+            transformer_block(x.data(), weights, prefix, seq_len, n_embd, n_head, eps,
+                               use_tiled, nullptr, use_threaded);
         }
 
         std::vector<float> final_ln_out(seq_len * n_embd);
@@ -493,7 +544,7 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
 std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
                                   const std::unordered_map<std::string, Tensor>& weights,
                                   int n_embd, int n_head, int n_layer, float eps,
-                                  int num_new_tokens, bool use_tiled) {
+                                  int num_new_tokens, bool use_tiled, bool use_threaded) {
     std::vector<int> ids = prompt_ids;
     if (num_new_tokens <= 0) return ids;
 
@@ -503,7 +554,8 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
     std::vector<LayerKVCache> cache(n_layer);
 
     // prefill: process the whole prompt in one pass, populating every layer's
-    // cache, then pick the first new token from the prompt's last position
+    // cache, then pick the first new token from the prompt's last position.
+    // use_threaded only matters here -- decode below is always a single row
     std::vector<float> x(prompt_len * n_embd);
     embed(ids.data(), weights.at("wte").data.data(), weights.at("wpe").data.data(),
           x.data(), prompt_len, n_embd);
@@ -511,7 +563,7 @@ std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
     for (int layer = 0; layer < n_layer; ++layer) {
         std::string prefix = "h." + std::to_string(layer) + ".";
         transformer_block(x.data(), weights, prefix, prompt_len, n_embd, n_head, eps,
-                           use_tiled, &cache[layer]);
+                           use_tiled, &cache[layer], use_threaded);
     }
 
     std::vector<float> final_ln_out(prompt_len * n_embd);
