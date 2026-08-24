@@ -6,20 +6,21 @@ PyTorch only shows up once, offline, in `python/dump_reference.py`. It loads the
 
 ## What's in here
 
-Four stages, each one checked against the real model before moving on to the next:
+Five stages, each one checked against the real model before moving on to the next:
 
 1. **Correct forward pass.** Embeddings, LayerNorm, multi-head causal self-attention, MLP, the full 12-block residual stream, final projection to logits. Validated against PyTorch's own output at every checkpoint, not just the final answer.
 2. **Cache-aware tiling.** Restructured the matrix multiplications so they reuse data while it's still sitting in CPU cache, instead of hitting RAM over and over.
 3. **SIMD vectorization.** Hand-wrote AVX2 intrinsics for the one function that actually needed them, after checking what the compiler already handled on its own.
 4. **KV-cache and a real generation loop.** Added greedy decoding so the model can actually generate new text, then cached the attention K/V vectors so each new token doesn't require recomputing the whole sequence from scratch.
+5. **Multithreading.** Split the matrix multiplications across CPU cores on top of the tiling and SIMD work, since computing different output rows is completely independent and needs no locking.
 
 ## Results
 
 | What | Naive | Optimized | Speedup |
 |---|---|---|---|
-| `matmul`, isolated (M=64, K=768, N=3072) | 921-1327 ms | 87 ms tiled, 25 ms tiled+SIMD | ~15x, then ~37-53x |
-| `linear`, one block (real weight shapes) | 308-448 ms | 161-195 ms tiled | ~1.9-2.3x |
-| Full 12-block forward pass, real engine | 5601 ms | 2459 ms | ~2.28x |
+| `matmul`, isolated (M=64, K=768, N=3072) | 921-1327 ms | 87 ms tiled, 25 ms tiled+SIMD, 4-5 ms tiled+SIMD+threaded | ~15x, ~37-53x, ~200-300x |
+| `linear`, one block (real weight shapes) | 308-448 ms | 161-195 ms tiled, 47-155 ms threaded | ~1.9-2.3x, then further with threading |
+| Full 12-block forward pass, real engine | 3201-5601 ms | 1850-2459 ms tiled, 587 ms threaded | ~2.28x tiled, ~5.5x threaded |
 | Generation, 20 new tokens | 20663 ms | 2246 ms with KV-cache | ~9.2x |
 
 The forward pass row and the generation row are the ones that actually matter. They're not projections pulled from some isolated benchmark, they're the real binary, timed directly, with every path checked for correctness before I trusted the speed numbers.
@@ -71,6 +72,16 @@ Before trusting the speedup I checked that `generate_cached()` produces byte-for
 
 I also put together a small end-to-end demo. `python/chat.py` tokenizes a text prompt with the real GPT-2 tokenizer, calls the C++ `generate` binary (which uses the cached path by default), and decodes the result back into text. Typed "Once upon a time" in and got "Once upon a time, the world was a place of great beauty and great danger" back out.
 
+### Stage 5: multithreading
+
+Everything up to this point ran on a single CPU core. `matmul`'s output rows are completely independent of each other though: computing row 5 never reads or writes anything row 12 touches. That independence means I can hand different rows to different threads and never worry about two threads stepping on the same memory, no locks needed anywhere.
+
+`matmul_threaded` splits the output rows into chunks, spawns a `std::thread` per chunk (each one just calls the existing `matmul_simd` on its own slice), and joins them all before returning. `linear_threaded` does the same thing for `linear_tiled`, since `linear` is what actually does the heavy lifting in the real model.
+
+Checked both against the naive version first, same as every other stage, then wired `use_threaded` through `attention()` and `transformer_block()` the same way `use_tiled` already worked. Measured on the real engine, a full 12-block forward pass: naive 3201 ms, tiled 1850 ms, threaded 587 ms. About 3.15x on top of tiling, 5.5x combined versus the original naive version.
+
+One thing that almost fooled me: an early run of the per-shape linear benchmark showed one shape, `mlp.c_fc`, getting way slower with threading (50 ms tiled versus 125 ms threaded) while every other shape got faster. Instead of writing that down as a real finding, I reran it a few times. The regression didn't come back, it was just a one-off scheduling hiccup on this machine. Same lesson as the `TILE=16` investigation earlier: one weird number isn't a finding until it repeats.
+
 ## Build and run
 
 Requires g++ with C++17 and AVX2/FMA support (checked via `-march=native`).
@@ -99,4 +110,4 @@ cd python && python3 benchmark_pytorch.py
 
 ## What's not here yet
 
-INT8 quantization and multithreading are natural next steps but I didn't get to them here. This project ended up being about cache-aware tiling, SIMD, and getting a real generation loop with KV-cache working end to end, not maximum feature coverage.
+INT8 quantization is a natural next step but I didn't get to it here. This project ended up being about cache-aware tiling, SIMD, multithreading, and getting a real generation loop with KV-cache working end to end, not maximum feature coverage.
