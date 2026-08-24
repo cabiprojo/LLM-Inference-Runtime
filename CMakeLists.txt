@@ -27,3 +27,6 @@ target_link_libraries(bench_matmul PRIVATE ops)
 
 add_executable(generate_demo src/generate_demo.cpp)
 target_link_libraries(generate_demo PRIVATE ops)
+
+add_executable(generate src/generate.cpp)
+target_link_libraries(generate PRIVATE ops)

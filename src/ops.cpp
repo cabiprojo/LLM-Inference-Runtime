@@ -42,6 +42,13 @@ void embed(const int* token_ids, const float* wte, const float* wpe,
     }
 }
 
+void embed_one(int token_id, int position, const float* wte, const float* wpe,
+               float* out, int n_embd) {
+    for (int j = 0; j < n_embd; ++j) {
+        out[j] = wte[token_id * n_embd + j] + wpe[position * n_embd + j];
+    }
+}
+
 void gelu(const float* x, float* out, int n) {
     constexpr float k = 0.7978845608f;  // sqrt(2/pi)
     for (int i = 0; i < n; ++i) {
@@ -233,13 +240,28 @@ void call_linear(bool use_tiled, const float* x, const float* W, const float* b,
 
 void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
                const float* c_proj_w, const float* c_proj_b,
-               float* out, int seq_len, int n_embd, int n_head, bool use_tiled) {
+               float* out, int seq_len, int n_embd, int n_head, bool use_tiled,
+               LayerKVCache* cache) {
     int head_dim = n_embd / n_head;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     // combined q, k, v projection in one linear call
     std::vector<float> qkv(seq_len * 3 * n_embd);
     call_linear(use_tiled, x, c_attn_w, c_attn_b, qkv.data(), seq_len, n_embd, 3 * n_embd);
+
+    // prefill: populate the cache with every position's K/V so decode steps
+    // afterward don't need to recompute them
+    if (cache != nullptr) {
+        cache->K.reserve(cache->K.size() + seq_len * n_embd);
+        cache->V.reserve(cache->V.size() + seq_len * n_embd);
+        for (int i = 0; i < seq_len; ++i) {
+            const float* k_row = qkv.data() + i * 3 * n_embd + n_embd;
+            const float* v_row = qkv.data() + i * 3 * n_embd + 2 * n_embd;
+            cache->K.insert(cache->K.end(), k_row, k_row + n_embd);
+            cache->V.insert(cache->V.end(), v_row, v_row + n_embd);
+        }
+        cache->cached_len += seq_len;
+    }
 
     std::vector<float> concat(seq_len * n_embd);
     std::vector<float> Qh(seq_len * head_dim);
@@ -285,9 +307,69 @@ void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
     call_linear(use_tiled, concat.data(), c_proj_w, c_proj_b, out, seq_len, n_embd, n_embd);
 }
 
+void attention_decode(const float* x_new, const float* c_attn_w, const float* c_attn_b,
+                       const float* c_proj_w, const float* c_proj_b,
+                       float* out, int n_embd, int n_head, LayerKVCache& cache) {
+    int head_dim = n_embd / n_head;
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    // q, k, v for just this one new token
+    std::vector<float> qkv_new(3 * n_embd);
+    linear(x_new, c_attn_w, c_attn_b, qkv_new.data(), 1, n_embd, 3 * n_embd);
+    const float* q_new = qkv_new.data();
+
+    // append this token's own K, V onto the cache -- it can attend to itself too
+    const float* k_new = qkv_new.data() + n_embd;
+    const float* v_new = qkv_new.data() + 2 * n_embd;
+    cache.K.insert(cache.K.end(), k_new, k_new + n_embd);
+    cache.V.insert(cache.V.end(), v_new, v_new + n_embd);
+    cache.cached_len += 1;
+
+    int total_len = cache.cached_len;  // includes the new token, just appended
+    std::vector<float> concat(n_embd);
+    std::vector<float> scores(total_len);
+
+    for (int h = 0; h < n_head; ++h) {
+        // scores = q_new_h @ K_cache_h^T * scale -- no causal mask needed,
+        // every cached position is <= this token's own position by construction
+        for (int j = 0; j < total_len; ++j) {
+            float sum = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                sum += q_new[h * head_dim + d] * cache.K[j * n_embd + h * head_dim + d];
+            }
+            scores[j] = sum * scale;
+        }
+
+        // plain softmax over all total_len cached positions (numerically stable)
+        float max_val = scores[0];
+        for (int j = 1; j < total_len; ++j) {
+            if (scores[j] > max_val) max_val = scores[j];
+        }
+        float sum_exp = 0.0f;
+        for (int j = 0; j < total_len; ++j) {
+            scores[j] = std::exp(scores[j] - max_val);
+            sum_exp += scores[j];
+        }
+        for (int j = 0; j < total_len; ++j) {
+            scores[j] /= sum_exp;
+        }
+
+        // this head's output = weighted sum of every cached V, weighted by scores
+        for (int d = 0; d < head_dim; ++d) {
+            float sum = 0.0f;
+            for (int j = 0; j < total_len; ++j) {
+                sum += scores[j] * cache.V[j * n_embd + h * head_dim + d];
+            }
+            concat[h * head_dim + d] = sum;
+        }
+    }
+
+    linear(concat.data(), c_proj_w, c_proj_b, out, 1, n_embd, n_embd);
+}
+
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
                         const std::string& prefix, int seq_len, int n_embd, int n_head, float eps,
-                        bool use_tiled) {
+                        bool use_tiled, LayerKVCache* cache) {
     std::vector<float> ln1_out(seq_len * n_embd);
     layer_norm(x, weights.at(prefix + "ln_1.weight").data.data(),
                weights.at(prefix + "ln_1.bias").data.data(),
@@ -299,7 +381,7 @@ void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& 
               weights.at(prefix + "attn.c_attn.bias").data.data(),
               weights.at(prefix + "attn.c_proj.weight").data.data(),
               weights.at(prefix + "attn.c_proj.bias").data.data(),
-              attn_out.data(), seq_len, n_embd, n_head, use_tiled);
+              attn_out.data(), seq_len, n_embd, n_head, use_tiled, cache);
 
     for (int i = 0; i < seq_len * n_embd; ++i) {
         x[i] += attn_out[i];
@@ -324,6 +406,48 @@ void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& 
 
     for (int i = 0; i < seq_len * n_embd; ++i) {
         x[i] += mlp_out[i];
+    }
+}
+
+void transformer_block_decode(float* x_new, const std::unordered_map<std::string, Tensor>& weights,
+                               const std::string& prefix, int n_embd, int n_head, float eps,
+                               LayerKVCache& cache, bool use_tiled) {
+    std::vector<float> ln1_out(n_embd);
+    layer_norm(x_new, weights.at(prefix + "ln_1.weight").data.data(),
+               weights.at(prefix + "ln_1.bias").data.data(),
+               ln1_out.data(), 1, n_embd, eps);
+
+    std::vector<float> attn_out(n_embd);
+    attention_decode(ln1_out.data(),
+                      weights.at(prefix + "attn.c_attn.weight").data.data(),
+                      weights.at(prefix + "attn.c_attn.bias").data.data(),
+                      weights.at(prefix + "attn.c_proj.weight").data.data(),
+                      weights.at(prefix + "attn.c_proj.bias").data.data(),
+                      attn_out.data(), n_embd, n_head, cache);
+
+    for (int i = 0; i < n_embd; ++i) {
+        x_new[i] += attn_out[i];
+    }
+
+    std::vector<float> ln2_out(n_embd);
+    layer_norm(x_new, weights.at(prefix + "ln_2.weight").data.data(),
+               weights.at(prefix + "ln_2.bias").data.data(),
+               ln2_out.data(), 1, n_embd, eps);
+
+    int mlp_hidden = weights.at(prefix + "mlp.c_fc.weight").shape[0];
+    std::vector<float> fc_out(mlp_hidden);
+    call_linear(use_tiled, ln2_out.data(), weights.at(prefix + "mlp.c_fc.weight").data.data(),
+                weights.at(prefix + "mlp.c_fc.bias").data.data(),
+                fc_out.data(), 1, n_embd, mlp_hidden);
+    gelu(fc_out.data(), fc_out.data(), mlp_hidden);
+
+    std::vector<float> mlp_out(n_embd);
+    call_linear(use_tiled, fc_out.data(), weights.at(prefix + "mlp.c_proj.weight").data.data(),
+                weights.at(prefix + "mlp.c_proj.bias").data.data(),
+                mlp_out.data(), 1, mlp_hidden, n_embd);
+
+    for (int i = 0; i < n_embd; ++i) {
+        x_new[i] += mlp_out[i];
     }
 }
 
@@ -361,6 +485,71 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
 
         int next_id = argmax(logits.data(), vocab_size);
         ids.push_back(next_id);
+    }
+
+    return ids;
+}
+
+std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
+                                  const std::unordered_map<std::string, Tensor>& weights,
+                                  int n_embd, int n_head, int n_layer, float eps,
+                                  int num_new_tokens, bool use_tiled) {
+    std::vector<int> ids = prompt_ids;
+    if (num_new_tokens <= 0) return ids;
+
+    const int vocab_size = weights.at("wte").shape[0];
+    std::vector<float> zero_bias(vocab_size, 0.0f);
+    const int prompt_len = static_cast<int>(prompt_ids.size());
+    std::vector<LayerKVCache> cache(n_layer);
+
+    // prefill: process the whole prompt in one pass, populating every layer's
+    // cache, then pick the first new token from the prompt's last position
+    std::vector<float> x(prompt_len * n_embd);
+    embed(ids.data(), weights.at("wte").data.data(), weights.at("wpe").data.data(),
+          x.data(), prompt_len, n_embd);
+
+    for (int layer = 0; layer < n_layer; ++layer) {
+        std::string prefix = "h." + std::to_string(layer) + ".";
+        transformer_block(x.data(), weights, prefix, prompt_len, n_embd, n_head, eps,
+                           use_tiled, &cache[layer]);
+    }
+
+    std::vector<float> final_ln_out(prompt_len * n_embd);
+    layer_norm(x.data(), weights.at("ln_f.weight").data.data(),
+               weights.at("ln_f.bias").data.data(),
+               final_ln_out.data(), prompt_len, n_embd, eps);
+
+    const float* last_row = final_ln_out.data() + (prompt_len - 1) * n_embd;
+    std::vector<float> logits(vocab_size);
+    linear(last_row, weights.at("wte").data.data(), zero_bias.data(),
+           logits.data(), 1, n_embd, vocab_size);
+    ids.push_back(argmax(logits.data(), vocab_size));
+
+    // decode: one new token at a time, reusing the cache instead of recomputing
+    // the whole sequence -- this is the loop that's actually fast
+    for (int step = 1; step < num_new_tokens; ++step) {
+        int position = static_cast<int>(ids.size()) - 1;  // this new token's absolute position
+        int token_id = ids.back();
+
+        std::vector<float> x_new(n_embd);
+        embed_one(token_id, position, weights.at("wte").data.data(), weights.at("wpe").data.data(),
+                  x_new.data(), n_embd);
+
+        for (int layer = 0; layer < n_layer; ++layer) {
+            std::string prefix = "h." + std::to_string(layer) + ".";
+            transformer_block_decode(x_new.data(), weights, prefix, n_embd, n_head, eps,
+                                      cache[layer], use_tiled);
+        }
+
+        std::vector<float> final_ln_new(n_embd);
+        layer_norm(x_new.data(), weights.at("ln_f.weight").data.data(),
+                   weights.at("ln_f.bias").data.data(),
+                   final_ln_new.data(), 1, n_embd, eps);
+
+        std::vector<float> logits_new(vocab_size);
+        linear(final_ln_new.data(), weights.at("wte").data.data(), zero_bias.data(),
+               logits_new.data(), 1, n_embd, vocab_size);
+        ids.push_back(argmax(logits_new.data(), vocab_size));
     }
 
     return ids;

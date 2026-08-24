@@ -1,3 +1,4 @@
+#include <chrono>
 #include <iostream>
 #include <vector>
 
@@ -49,5 +50,30 @@ int main() {
     std::cout << (match ? "[PASS] " : "[FAIL] ")
                << "generate() matches HuggingFace's greedy generation\n";
 
-    return match ? 0 : 1;
+    // KV-cache must be a pure speed optimization -- same prompt, same
+    // num_new_tokens, must produce the exact same ids as the non-cached version
+    std::vector<int> cached = generate_cached(prompt, weights, n_embd, n_head, n_layer, eps, num_new_tokens);
+    bool cache_match = (cached == generated);
+    std::cout << (cache_match ? "[PASS] " : "[FAIL] ")
+               << "generate_cached() matches generate() exactly\n";
+
+    // real timing comparison, on a longer generation where the difference
+    // between "recompute everything" and "reuse the cache" actually shows up
+    const int bench_new_tokens = 20;
+    std::cout << "\ntiming: " << bench_new_tokens << " new tokens from the same "
+              << prompt_len << "-token prompt\n";
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    generate(prompt, weights, n_embd, n_head, n_layer, eps, bench_new_tokens);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    generate_cached(prompt, weights, n_embd, n_head, n_layer, eps, bench_new_tokens);
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    double naive_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
+    double cached_ms = std::chrono::duration<double>(t2 - t1).count() * 1000.0;
+    std::cout << "  naive (recompute every step):  " << naive_ms << " ms\n";
+    std::cout << "  cached (KV-cache):              " << cached_ms << " ms\n";
+    std::cout << "  speedup: " << naive_ms / cached_ms << "x\n";
+
+    return (match && cache_match) ? 0 : 1;
 }

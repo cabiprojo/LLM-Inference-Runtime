@@ -24,6 +24,11 @@ void layer_norm(const float* x, const float* gamma, const float* beta,
 void embed(const int* token_ids, const float* wte, const float* wpe,
            float* out, int seq_len, int n_embd);
 
+// same as embed(), but for exactly one token at an arbitrary position --
+// needed for KV-cache decode, where the new token isn't at position 0
+void embed_one(int token_id, int position, const float* wte, const float* wpe,
+                float* out, int n_embd);
+
 // nonlinearity applied inside the mlp
 // GPT-2's tanh-approximation gelu, applied elementwise
 // n = total element count
@@ -61,15 +66,35 @@ void linear(const float* x, const float* W, const float* b,
 void linear_tiled(const float* x, const float* W, const float* b,
                    float* out, int seq_len, int in_features, int out_features, int TILE);
 
+// per-layer K/V history for KV-cache generation. K and V grow by one row
+// (n_embd floats) each time a new token is processed, whether via prefill
+// (many rows at once) or decode (one row at a time)
+struct LayerKVCache {
+    std::vector<float> K;  // (cached_len, n_embd), flat, row-major
+    std::vector<float> V;  // (cached_len, n_embd), flat, row-major
+    int cached_len = 0;
+};
+
 // multi-head causal self-attention for one block
 // x: (seq_len, n_embd), layer-normed input (ln_1 output)
 // c_attn_w: (3*n_embd, n_embd), c_attn_b: (3*n_embd), combined qkv projection
 // c_proj_w: (n_embd, n_embd), c_proj_b: (n_embd), output projection
 // out: (seq_len, n_embd)
 // use_tiled: if true, internal linear() calls use linear_tiled(TILE=16) instead
+// cache: if non-null, this call's K/V (for every position in x) are appended
+//   to it -- used for prefill, populating the cache from the initial prompt
 void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
                const float* c_proj_w, const float* c_proj_b,
-               float* out, int seq_len, int n_embd, int n_head, bool use_tiled = false);
+               float* out, int seq_len, int n_embd, int n_head, bool use_tiled = false,
+               LayerKVCache* cache = nullptr);
+
+// attention for exactly one new token, using and extending a KV-cache instead
+// of recomputing K/V for the whole sequence. x_new: (1, n_embd). appends this
+// token's K/V onto cache, then attends its Q against the full (old + new) cache.
+// out: (1, n_embd)
+void attention_decode(const float* x_new, const float* c_attn_w, const float* c_attn_b,
+                       const float* c_proj_w, const float* c_proj_b,
+                       float* out, int n_embd, int n_head, LayerKVCache& cache);
 
 // one transformer block, x is updated in place to become this block's output
 // ln_1 -> attention -> residual add -> ln_2 -> mlp -> residual add
@@ -77,7 +102,13 @@ void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
 // use_tiled: if true, every internal linear() call uses linear_tiled(TILE=16) instead
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
                         const std::string& prefix, int seq_len, int n_embd, int n_head, float eps,
-                        bool use_tiled = false);
+                        bool use_tiled = false, LayerKVCache* cache = nullptr);
+
+// one transformer block for exactly one new token, using and extending cache.
+// x_new: (1, n_embd), updated in place to become this block's output for the new token
+void transformer_block_decode(float* x_new, const std::unordered_map<std::string, Tensor>& weights,
+                               const std::string& prefix, int n_embd, int n_head, float eps,
+                               LayerKVCache& cache, bool use_tiled = false);
 
 // greedy autoregressive generation: repeatedly runs the full forward pass,
 // picks the most likely next token, appends it, and repeats. no KV-cache yet,
@@ -91,3 +122,13 @@ std::vector<int> generate(const std::vector<int>& prompt_ids,
                            const std::unordered_map<std::string, Tensor>& weights,
                            int n_embd, int n_head, int n_layer, float eps,
                            int num_new_tokens, bool use_tiled = false);
+
+// same generation, but KV-cached: the prompt is processed once (prefill,
+// populating the cache), then each new token only computes its own Q/K/V and
+// attends against the accumulated cache instead of recomputing the whole
+// sequence from scratch every step. Must produce identical output to
+// generate() for the same inputs -- this is a speed optimization only.
+std::vector<int> generate_cached(const std::vector<int>& prompt_ids,
+                                  const std::unordered_map<std::string, Tensor>& weights,
+                                  int n_embd, int n_head, int n_layer, float eps,
+                                  int num_new_tokens, bool use_tiled = false);
