@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "io/tensor_io.h"
 
@@ -77,3 +78,16 @@ void attention(const float* x, const float* c_attn_w, const float* c_attn_b,
 void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& weights,
                         const std::string& prefix, int seq_len, int n_embd, int n_head, float eps,
                         bool use_tiled = false);
+
+// greedy autoregressive generation: repeatedly runs the full forward pass,
+// picks the most likely next token, appends it, and repeats. no KV-cache yet,
+// so every step recomputes the whole sequence from scratch -- correct, not fast.
+// prompt_ids: starting tokens
+// weights: full weight map, as loaded by load_tensors()
+// n_embd, n_head, n_layer, eps: model config (768, 12, 12, 1e-5 for GPT-2 small)
+// num_new_tokens: how many additional tokens to generate
+// returns: prompt_ids followed by num_new_tokens generated ids
+std::vector<int> generate(const std::vector<int>& prompt_ids,
+                           const std::unordered_map<std::string, Tensor>& weights,
+                           int n_embd, int n_head, int n_layer, float eps,
+                           int num_new_tokens, bool use_tiled = false);

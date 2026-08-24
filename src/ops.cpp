@@ -326,3 +326,42 @@ void transformer_block(float* x, const std::unordered_map<std::string, Tensor>& 
         x[i] += mlp_out[i];
     }
 }
+
+std::vector<int> generate(const std::vector<int>& prompt_ids,
+                           const std::unordered_map<std::string, Tensor>& weights,
+                           int n_embd, int n_head, int n_layer, float eps,
+                           int num_new_tokens, bool use_tiled) {
+    std::vector<int> ids = prompt_ids;
+    const int vocab_size = weights.at("wte").shape[0];
+    std::vector<float> zero_bias(vocab_size, 0.0f);
+
+    for (int step = 0; step < num_new_tokens; ++step) {
+        int seq_len = static_cast<int>(ids.size());
+
+        std::vector<float> x(seq_len * n_embd);
+        embed(ids.data(), weights.at("wte").data.data(), weights.at("wpe").data.data(),
+              x.data(), seq_len, n_embd);
+
+        for (int layer = 0; layer < n_layer; ++layer) {
+            std::string prefix = "h." + std::to_string(layer) + ".";
+            transformer_block(x.data(), weights, prefix, seq_len, n_embd, n_head, eps, use_tiled);
+        }
+
+        std::vector<float> final_ln_out(seq_len * n_embd);
+        layer_norm(x.data(), weights.at("ln_f.weight").data.data(),
+                   weights.at("ln_f.bias").data.data(),
+                   final_ln_out.data(), seq_len, n_embd, eps);
+
+        // only the last position's logits are needed to pick the next token,
+        // so linear() is called on just that one row instead of the whole sequence
+        const float* last_row = final_ln_out.data() + (seq_len - 1) * n_embd;
+        std::vector<float> logits(vocab_size);
+        linear(last_row, weights.at("wte").data.data(), zero_bias.data(),
+               logits.data(), 1, n_embd, vocab_size);
+
+        int next_id = argmax(logits.data(), vocab_size);
+        ids.push_back(next_id);
+    }
+
+    return ids;
+}

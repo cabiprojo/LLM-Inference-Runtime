@@ -186,10 +186,27 @@ def main():
     assert max_diff < 1e-3, "Manual forward pass doesn't match HF's own output -- reference is untrustworthy!"
     print("Manual forward pass matches HuggingFace's forward pass. Reference is trustworthy.")
 
+    # --- Greedy generation ground truth, for validating generate() in C++ ---
+    # HF's own greedy decoding (do_sample=False) from the same prompt -- the
+    # C++ generation loop should produce this exact continuation, token for
+    # token, since both are doing the same deterministic argmax decoding.
+    NUM_NEW_TOKENS = 10
+    with torch.no_grad():
+        generated = model.generate(
+            input_ids.unsqueeze(0), max_new_tokens=NUM_NEW_TOKENS,
+            do_sample=False, pad_token_id=model.config.eos_token_id,
+        )
+    generated_ids = generated.squeeze(0).tolist()
+    print(f"HF greedy generation ({NUM_NEW_TOKENS} new tokens): {generated_ids}")
+
     # --- Save everything ---
     save_tensors(DATA_DIR / "gpt2_weights.bin", weights)
 
-    activations = {"input_ids": torch.tensor(INPUT_IDS, dtype=torch.int32), **checkpoints}
+    activations = {
+        "input_ids": torch.tensor(INPUT_IDS, dtype=torch.int32),
+        "generated_ids": torch.tensor(generated_ids, dtype=torch.int32),
+        **checkpoints,
+    }
     save_tensors(DATA_DIR / "reference_activations.bin", activations)
 
     manifest = {
@@ -197,6 +214,7 @@ def main():
         "n_layer": n_layer, "n_head": n_head, "n_embd": n_embd,
         "layer_norm_eps": eps,
         "input_ids": INPUT_IDS,
+        "generated_ids": generated_ids,
         "weight_shapes": {k: list(v.shape) for k, v in weights.items()},
         "activation_shapes": {k: list(v.shape) for k, v in checkpoints.items()},
     }

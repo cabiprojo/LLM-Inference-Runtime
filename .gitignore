@@ -3,3 +3,4 @@ data/
 python/venv/
 python/__pycache__/
 *.pyc
+.claude/
