@@ -24,6 +24,8 @@ Four stages, each one checked against the real model before moving on to the nex
 
 The forward pass row and the generation row are the ones that actually matter. They're not projections pulled from some isolated benchmark, they're the real binary, timed directly, with every path checked for correctness before I trusted the speed numbers.
 
+**Honest comparison against plain PyTorch:** running the same 20-token generation through PyTorch on CPU (`python/benchmark_pytorch.py`, single-threaded, same prompt) takes about 751 ms, versus 2246 ms for my KV-cached engine. PyTorch is roughly 3x faster overall. That's expected, not a failure. PyTorch's CPU backend runs on Intel's oneDNN/MKL-DNN, production BLAS kernels with years of expert tuning (register blocking, prefetching, hand-tuned assembly) well beyond one pass at tiling and one hand-written SIMD loop, plus a memory allocator that avoids the repeated buffer allocations my engine does on every call. The point of this project was understanding and applying the techniques (cache locality, vectorization, KV-cache) from scratch, each one validated and each one measurably faster than the version before it, not beating a decade of production engineering.
+
 ## Architecture
 
 ```
@@ -90,6 +92,9 @@ cmake --build build
 
 # the actual demo: type a prompt, get generated text back
 cd python && python3 chat.py "Once upon a time" --num-new 20
+
+# how does it compare to plain PyTorch on CPU?
+cd python && python3 benchmark_pytorch.py
 ```
 
 ## What's not here yet
